@@ -8149,7 +8149,7 @@ size_t SaveEXRMultipartImageToMemory(const EXRImage* exr_images,
                                      const EXRHeader** exr_headers,
                                      unsigned int num_parts,
                                      unsigned char** memory_out, const char** err) {
-  if (exr_images == NULL || exr_headers == NULL || num_parts < 2 ||
+  if (exr_images == NULL || exr_headers == NULL || num_parts == 0 ||
       memory_out == NULL) {
     tinyexr::SetErrorMessage("Invalid argument for SaveEXRNPartImageToMemory",
                               err);
@@ -8163,7 +8163,7 @@ int SaveEXRMultipartImageToFile(const EXRImage* exr_images,
                                 unsigned int num_parts,
                                 const char* filename,
                                 const char** err) {
-  if (exr_images == NULL || exr_headers == NULL || num_parts < 2) {
+  if (exr_images == NULL || exr_headers == NULL || num_parts == 0) {
     tinyexr::SetErrorMessage("Invalid argument for SaveEXRMultipartImageToFile",
                               err);
     return TINYEXR_ERROR_INVALID_ARGUMENT;
