@@ -5442,10 +5442,11 @@ static int DecodeChunk(EXRImage *exr_image, const EXRHeader *exr_header,
                 if (line_no < 0) {
                   invalid_data = true;
                 } else {
+                  // Line order is increasing because we read in line offset table order.
                   if (!tinyexr::DecodePixelData(
                           exr_image->images, exr_header->requested_pixel_types,
                           data_ptr, static_cast<size_t>(data_len),
-                          exr_header->compression_type, exr_header->line_order,
+                          exr_header->compression_type, /* line_order*/ 0,
                           int(data_width), int(data_height), int(data_width), y, line_no,
                           num_lines, static_cast<size_t>(pixel_data_size),
                           static_cast<size_t>(
