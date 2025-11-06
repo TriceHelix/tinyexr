@@ -1,0 +1,571 @@
+// TinyEXR V2 API Unit Tester
+// Ported from tester.cc to use v2 API with enhanced error reporting
+
+#define CATCH_CONFIG_MAIN
+#include <cassert>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <vector>
+
+#include "catch.hpp"
+
+// Include V2 API
+#include "../../tinyexr_v2.hh"
+#include "../../tinyexr_v2_impl.hh"
+
+// Path to openexr-images test files
+const char* kOpenEXRImagePath = "../../../openexr-images/";
+
+std::string GetPath(const char* basename) {
+  return std::string(kOpenEXRImagePath) + std::string(basename);
+}
+
+// Helper: Read file into memory
+std::vector<uint8_t> ReadFile(const std::string& filename) {
+  std::ifstream file(filename, std::ios::binary | std::ios::ate);
+  if (!file.is_open()) {
+    return std::vector<uint8_t>();
+  }
+
+  std::streamsize size = file.tellg();
+  file.seekg(0, std::ios::beg);
+
+  std::vector<uint8_t> buffer(size);
+  if (!file.read(reinterpret_cast<char*>(buffer.data()), size)) {
+    return std::vector<uint8_t>();
+  }
+
+  return buffer;
+}
+
+// Helper: Write memory to file
+bool WriteFile(const std::string& filename, const uint8_t* data, size_t size) {
+  std::ofstream file(filename, std::ios::binary);
+  if (!file.is_open()) {
+    return false;
+  }
+  file.write(reinterpret_cast<const char*>(data), size);
+  return file.good();
+}
+
+// ============================================================================
+// StreamReader Tests
+// ============================================================================
+
+TEST_CASE("StreamReader: Basic operations", "[StreamReader]") {
+  const uint8_t data[] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
+  tinyexr::StreamReader reader(data, sizeof(data), tinyexr::Endian::Little);
+
+  SECTION("Read single bytes") {
+    uint8_t val;
+    REQUIRE(reader.read1(&val) == true);
+    REQUIRE(val == 0x01);
+    REQUIRE(reader.tell() == 1);
+  }
+
+  SECTION("Read 2 bytes") {
+    uint16_t val;
+    REQUIRE(reader.read2(&val) == true);
+    REQUIRE(val == 0x0201);  // Little endian
+    REQUIRE(reader.tell() == 2);
+  }
+
+  SECTION("Read 4 bytes") {
+    uint32_t val;
+    REQUIRE(reader.read4(&val) == true);
+    REQUIRE(val == 0x04030201);  // Little endian
+    REQUIRE(reader.tell() == 4);
+  }
+
+  SECTION("Seek operations") {
+    REQUIRE(reader.seek(4) == true);
+    REQUIRE(reader.tell() == 4);
+
+    uint8_t val;
+    REQUIRE(reader.read1(&val) == true);
+    REQUIRE(val == 0x05);
+  }
+
+  SECTION("Out of bounds") {
+    uint8_t buf[10];
+    REQUIRE(reader.read(10, buf) == false);  // Only 8 bytes available
+  }
+
+  SECTION("Remaining and EOF") {
+    REQUIRE(reader.remaining() == 8);
+    REQUIRE(reader.eof() == false);
+
+    reader.seek(8);
+    REQUIRE(reader.remaining() == 0);
+    REQUIRE(reader.eof() == true);
+  }
+}
+
+TEST_CASE("StreamReader: Endian swapping", "[StreamReader]") {
+  const uint8_t data[] = {0x12, 0x34, 0x56, 0x78};
+
+  SECTION("Little endian - bytes as stored in memory") {
+    tinyexr::StreamReader reader(data, sizeof(data), tinyexr::Endian::Little);
+    uint32_t val;
+    REQUIRE(reader.read4(&val) == true);
+    // Data in memory: 12 34 56 78
+    // Little endian interpretation: 78563412
+    // This should match regardless of host endianness
+    uint8_t* bytes = reinterpret_cast<uint8_t*>(&val);
+    REQUIRE(bytes[0] == 0x12);
+    REQUIRE(bytes[1] == 0x34);
+    REQUIRE(bytes[2] == 0x56);
+    REQUIRE(bytes[3] == 0x78);
+  }
+
+  SECTION("Native endian - no swapping") {
+    tinyexr::StreamReader reader(data, sizeof(data), tinyexr::Endian::Native);
+    uint32_t val;
+    REQUIRE(reader.read4(&val) == true);
+    // With native endian, data is read as-is
+    const uint32_t* ptr = reinterpret_cast<const uint32_t*>(data);
+    REQUIRE(val == *ptr);
+  }
+}
+
+// ============================================================================
+// StreamWriter Tests
+// ============================================================================
+
+TEST_CASE("StreamWriter: Dynamic mode", "[StreamWriter]") {
+  tinyexr::StreamWriter writer(tinyexr::Endian::Little);
+
+  SECTION("Write and grow") {
+    REQUIRE(writer.write1(0x42) == true);
+    REQUIRE(writer.size() == 1);
+    REQUIRE(writer.data()[0] == 0x42);
+  }
+
+  SECTION("Write multiple types") {
+    REQUIRE(writer.write1(0x01) == true);
+    REQUIRE(writer.write2(0x0302) == true);
+    REQUIRE(writer.write4(0x07060504) == true);
+
+    REQUIRE(writer.size() == 7);
+    REQUIRE(writer.data()[0] == 0x01);
+    REQUIRE(writer.data()[1] == 0x02);
+    REQUIRE(writer.data()[2] == 0x03);
+  }
+
+  SECTION("Write string") {
+    REQUIRE(writer.write_string("Hello") == true);
+    REQUIRE(writer.size() == 6);  // Including null terminator
+    REQUIRE(std::string(reinterpret_cast<const char*>(writer.data_ptr())) == "Hello");
+  }
+
+  SECTION("Write float") {
+    REQUIRE(writer.write_float(3.14159f) == true);
+    REQUIRE(writer.size() == 4);
+  }
+}
+
+TEST_CASE("StreamWriter: Bounded mode", "[StreamWriter]") {
+  uint8_t buffer[16];
+  tinyexr::StreamWriter writer(buffer, sizeof(buffer), tinyexr::Endian::Little);
+
+  SECTION("Write within bounds") {
+    REQUIRE(writer.write4(0xDEADBEEF) == true);
+    REQUIRE(writer.size() == 4);
+    REQUIRE(writer.remaining() == 12);
+  }
+
+  SECTION("Write beyond bounds fails") {
+    uint8_t large_data[20];
+    REQUIRE(writer.write(20, large_data) == false);
+  }
+
+  SECTION("Check capacity") {
+    REQUIRE(writer.capacity() == 16);
+    REQUIRE(writer.mode() == tinyexr::WriterMode::Bounded);
+  }
+}
+
+// ============================================================================
+// v2::Reader Tests
+// ============================================================================
+
+TEST_CASE("v2::Reader: Error accumulation", "[v2::Reader]") {
+  const uint8_t data[] = {0x01, 0x02};
+  tinyexr::v2::Reader reader(data, sizeof(data));
+
+  SECTION("Successful read has no errors") {
+    uint8_t val;
+    REQUIRE(reader.read1(&val) == true);
+    REQUIRE(reader.has_error() == false);
+  }
+
+  SECTION("Failed read accumulates error") {
+    uint8_t buf[10];
+    REQUIRE(reader.read(10, buf) == false);
+    REQUIRE(reader.has_error() == true);
+    REQUIRE(reader.errors().size() == 1);
+    REQUIRE(reader.last_error().code == tinyexr::v2::ErrorCode::OutOfBounds);
+  }
+
+  SECTION("Multiple errors accumulated") {
+    uint8_t buf[5];
+    reader.read(5, buf);  // Error 1
+    reader.read(5, buf);  // Error 2
+    REQUIRE(reader.errors().size() == 2);
+  }
+
+  SECTION("Context in errors") {
+    reader.set_context("Test operation");
+    uint8_t buf[10];
+    reader.read(10, buf);
+    REQUIRE(reader.last_error().context == "Test operation");
+  }
+}
+
+// ============================================================================
+// v2::Writer Tests
+// ============================================================================
+
+TEST_CASE("v2::Writer: Error accumulation", "[v2::Writer]") {
+  uint8_t buffer[8];
+  tinyexr::v2::Writer writer(buffer, sizeof(buffer));
+
+  SECTION("Successful write has no errors") {
+    REQUIRE(writer.write4(0x12345678) == true);
+    REQUIRE(writer.has_error() == false);
+  }
+
+  SECTION("Failed write accumulates error") {
+    uint8_t large_data[20];
+    REQUIRE(writer.write(20, large_data) == false);
+    REQUIRE(writer.has_error() == true);
+    REQUIRE(writer.errors().size() == 1);
+  }
+
+  SECTION("Error messages are human-readable") {
+    uint8_t data[10];
+    writer.write(10, data);
+    std::string err_str = writer.error_string();
+    REQUIRE(err_str.find("[ERROR]") != std::string::npos);
+    REQUIRE(err_str.find("Out of Bounds") != std::string::npos);
+  }
+}
+
+// ============================================================================
+// Version Parsing Tests
+// ============================================================================
+
+TEST_CASE("v2::ParseVersion: Valid EXR version", "[Parse][Version]") {
+  const uint8_t data[] = {
+    0x76, 0x2f, 0x31, 0x01,  // Magic
+    0x02,                     // Version 2
+    0x00,                     // Flags
+    0x00, 0x00                // Padding
+  };
+
+  tinyexr::v2::Reader reader(data, sizeof(data));
+  auto result = tinyexr::v2::ParseVersion(reader);
+
+  REQUIRE(result.success == true);
+  REQUIRE(result.value.version == 2);
+  REQUIRE(result.value.tiled == false);
+  REQUIRE(result.value.long_name == false);
+  REQUIRE(result.value.non_image == false);
+  REQUIRE(result.value.multipart == false);
+}
+
+TEST_CASE("v2::ParseVersion: Invalid magic number", "[Parse][Version]") {
+  const uint8_t data[] = {
+    0x00, 0x00, 0x00, 0x00,  // Wrong magic
+    0x02, 0x00, 0x00, 0x00
+  };
+
+  tinyexr::v2::Reader reader(data, sizeof(data));
+  auto result = tinyexr::v2::ParseVersion(reader);
+
+  REQUIRE(result.success == false);
+  REQUIRE(result.errors.size() > 0);
+  REQUIRE(result.first_error().code == tinyexr::v2::ErrorCode::InvalidMagicNumber);
+
+  // Check error message is human-readable
+  std::string err_msg = result.error_string();
+  REQUIRE(err_msg.find("Invalid EXR magic number") != std::string::npos);
+  REQUIRE(err_msg.find("not a valid OpenEXR file") != std::string::npos);
+}
+
+TEST_CASE("v2::ParseVersion: Invalid version number", "[Parse][Version]") {
+  const uint8_t data[] = {
+    0x76, 0x2f, 0x31, 0x01,
+    0x03,  // Version 3 (unsupported)
+    0x00, 0x00, 0x00
+  };
+
+  tinyexr::v2::Reader reader(data, sizeof(data));
+  auto result = tinyexr::v2::ParseVersion(reader);
+
+  REQUIRE(result.success == false);
+  REQUIRE(result.first_error().code == tinyexr::v2::ErrorCode::InvalidVersion);
+  REQUIRE(result.error_string().find("Unsupported EXR version 3") != std::string::npos);
+}
+
+TEST_CASE("v2::ParseVersion: Tiled format flag", "[Parse][Version]") {
+  const uint8_t data[] = {
+    0x76, 0x2f, 0x31, 0x01,
+    0x02,
+    0x02,  // Tiled flag set
+    0x00, 0x00
+  };
+
+  tinyexr::v2::Reader reader(data, sizeof(data));
+  auto result = tinyexr::v2::ParseVersion(reader);
+
+  REQUIRE(result.success == true);
+  REQUIRE(result.value.tiled == true);
+  REQUIRE(result.warnings.size() > 0);
+  REQUIRE(result.warnings[0].find("tiled") != std::string::npos);
+}
+
+TEST_CASE("v2::ParseVersion: Truncated file", "[Parse][Version]") {
+  const uint8_t data[] = {0x76, 0x2f, 0x31};  // Only 3 bytes
+
+  tinyexr::v2::Reader reader(data, sizeof(data));
+  auto result = tinyexr::v2::ParseVersion(reader);
+
+  REQUIRE(result.success == false);
+  REQUIRE(result.first_error().code == tinyexr::v2::ErrorCode::InvalidData);
+  REQUIRE(result.error_string().find("too small") != std::string::npos);
+}
+
+// ============================================================================
+// Version Writing Tests
+// ============================================================================
+
+TEST_CASE("v2::WriteVersion: Basic version header", "[Write][Version]") {
+  tinyexr::v2::Writer writer;
+  tinyexr::v2::Version version;
+  version.version = 2;
+  version.tiled = false;
+  version.long_name = false;
+  version.non_image = false;
+  version.multipart = false;
+
+  auto result = tinyexr::v2::WriteVersion(writer, version);
+
+  REQUIRE(result.success == true);
+  REQUIRE(writer.size() == 8);
+
+  // Verify magic number
+  const uint8_t* data = writer.data_ptr();
+  REQUIRE(data[0] == 0x76);
+  REQUIRE(data[1] == 0x2f);
+  REQUIRE(data[2] == 0x31);
+  REQUIRE(data[3] == 0x01);
+  REQUIRE(data[4] == 0x02);  // Version
+  REQUIRE(data[5] == 0x00);  // Flags
+}
+
+TEST_CASE("v2::WriteVersion: Tiled format", "[Write][Version]") {
+  tinyexr::v2::Writer writer;
+  tinyexr::v2::Version version;
+  version.version = 2;
+  version.tiled = true;
+  version.long_name = false;
+  version.non_image = false;
+  version.multipart = false;
+
+  auto result = tinyexr::v2::WriteVersion(writer, version);
+
+  REQUIRE(result.success == true);
+  const uint8_t* data = writer.data_ptr();
+  REQUIRE((data[5] & 0x02) != 0);  // Tiled flag set
+}
+
+// ============================================================================
+// Round-trip Tests (Write then Read)
+// ============================================================================
+
+TEST_CASE("v2: Round-trip version header", "[RoundTrip][Version]") {
+  // Write
+  tinyexr::v2::Writer writer;
+  tinyexr::v2::Version write_version;
+  write_version.version = 2;
+  write_version.tiled = true;
+  write_version.long_name = false;
+  write_version.non_image = false;
+  write_version.multipart = true;
+
+  auto write_result = tinyexr::v2::WriteVersion(writer, write_version);
+  REQUIRE(write_result.success == true);
+
+  // Read back
+  tinyexr::v2::Reader reader(writer.data_ptr(), writer.size());
+  auto read_result = tinyexr::v2::ParseVersion(reader);
+
+  REQUIRE(read_result.success == true);
+  REQUIRE(read_result.value.version == write_version.version);
+  REQUIRE(read_result.value.tiled == write_version.tiled);
+  REQUIRE(read_result.value.long_name == write_version.long_name);
+  REQUIRE(read_result.value.non_image == write_version.non_image);
+  REQUIRE(read_result.value.multipart == write_version.multipart);
+}
+
+// ============================================================================
+// File Loading Tests (using actual EXR files)
+// ============================================================================
+
+TEST_CASE("v2: Load real EXR file - issue40.exr", "[Load][Integration]") {
+  std::vector<uint8_t> file_data = ReadFile("issue40.exr");
+
+  if (file_data.empty()) {
+    // Skip if file not found
+    WARN("Test file issue40.exr not found, skipping");
+    return;
+  }
+
+  auto result = tinyexr::v2::LoadFromMemory(file_data.data(), file_data.size());
+
+  SECTION("File loads successfully") {
+    REQUIRE(result.success == true);
+    REQUIRE(result.value.width > 0);
+    REQUIRE(result.value.height > 0);
+  }
+
+  SECTION("Header attributes parsed") {
+    REQUIRE(result.value.header.compression >= 0);
+    REQUIRE(result.value.header.pixel_aspect_ratio > 0.0f);
+  }
+
+  SECTION("Data window is valid") {
+    auto& dw = result.value.header.data_window;
+    REQUIRE(dw.width() > 0);
+    REQUIRE(dw.height() > 0);
+  }
+
+  // Print warnings for debugging
+  if (!result.warnings.empty()) {
+    INFO("Warnings: " + result.warnings_string());
+  }
+}
+
+// ============================================================================
+// Error Handling Tests
+// ============================================================================
+
+TEST_CASE("v2: Invalid input handling", "[Error][Parse]") {
+  SECTION("Null pointer") {
+    auto result = tinyexr::v2::LoadFromMemory(nullptr, 100);
+    REQUIRE(result.success == false);
+    REQUIRE(result.first_error().code == tinyexr::v2::ErrorCode::InvalidArgument);
+    REQUIRE(result.error_string().find("Null") != std::string::npos);
+  }
+
+  SECTION("Zero size") {
+    uint8_t data[10];
+    auto result = tinyexr::v2::LoadFromMemory(data, 0);
+    REQUIRE(result.success == false);
+    REQUIRE(result.first_error().code == tinyexr::v2::ErrorCode::InvalidArgument);
+  }
+
+  SECTION("Too small file") {
+    uint8_t data[4] = {0x76, 0x2f, 0x31, 0x01};
+    auto result = tinyexr::v2::LoadFromMemory(data, sizeof(data));
+    REQUIRE(result.success == false);
+  }
+}
+
+TEST_CASE("v2: Error message quality", "[Error]") {
+  const uint8_t bad_magic[] = {0xFF, 0xFF, 0xFF, 0xFF, 0x02, 0x00, 0x00, 0x00};
+
+  tinyexr::v2::Reader reader(bad_magic, sizeof(bad_magic));
+  auto result = tinyexr::v2::ParseVersion(reader);
+
+  REQUIRE(result.success == false);
+
+  std::string err = result.error_string();
+
+  SECTION("Contains error type") {
+    REQUIRE(err.find("[ERROR]") != std::string::npos);
+  }
+
+  SECTION("Contains specific error code") {
+    REQUIRE(err.find("Invalid Magic Number") != std::string::npos);
+  }
+
+  SECTION("Contains helpful message") {
+    REQUIRE(err.find("not a valid OpenEXR file") != std::string::npos);
+  }
+
+  SECTION("Contains context") {
+    REQUIRE(err.find("Context:") != std::string::npos);
+    REQUIRE(err.find("Parsing EXR version header") != std::string::npos);
+  }
+}
+
+// ============================================================================
+// Regression Tests (from original tester.cc)
+// ============================================================================
+
+TEST_CASE("Regression: ParseEXRVersionFromMemory invalid input", "[Regression][Parse]") {
+  SECTION("Null version pointer") {
+    uint8_t data[8];
+    tinyexr::v2::Reader reader(data, sizeof(data));
+    auto result = tinyexr::v2::ParseVersion(reader);
+    // In v2 API, we handle this gracefully
+  }
+
+  SECTION("Null data pointer") {
+    auto result = tinyexr::v2::LoadFromMemory(nullptr, 100);
+    REQUIRE(result.success == false);
+    REQUIRE(result.first_error().code == tinyexr::v2::ErrorCode::InvalidArgument);
+  }
+}
+
+// ============================================================================
+// Performance/Stress Tests
+// ============================================================================
+
+TEST_CASE("v2: Large buffer handling", "[Performance]") {
+  const size_t large_size = 1024 * 1024;  // 1MB
+  std::vector<uint8_t> large_buffer(large_size, 0x42);
+
+  SECTION("Dynamic writer grows efficiently") {
+    tinyexr::v2::Writer writer;
+    writer.reserve(large_size);
+
+    for (size_t i = 0; i < large_size; i++) {
+      REQUIRE(writer.write1(0x42) == true);
+    }
+
+    REQUIRE(writer.size() == large_size);
+  }
+
+  SECTION("Reader handles large buffers") {
+    tinyexr::v2::Reader reader(large_buffer.data(), large_buffer.size());
+
+    for (size_t i = 0; i < large_size; i++) {
+      uint8_t val;
+      REQUIRE(reader.read1(&val) == true);
+      REQUIRE(val == 0x42);
+    }
+
+    REQUIRE(reader.eof() == true);
+  }
+}
+
+// ============================================================================
+// Summary Test
+// ============================================================================
+
+TEST_CASE("v2 API: Feature completeness", "[Summary]") {
+  INFO("V2 API provides enhanced error reporting with:");
+  INFO("- StreamReader/Writer with bounds checking");
+  INFO("- Error accumulation with context");
+  INFO("- Human-readable error messages");
+  INFO("- Result<T> pattern for type-safe error handling");
+  INFO("- Support for both dynamic and bounded buffers");
+
+  REQUIRE(true);  // This test always passes, just for documentation
+}

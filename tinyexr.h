@@ -678,6 +678,9 @@ extern int LoadEXRFromMemory(float **out_rgba, int *width, int *height,
 #include <vector>
 #include <set>
 
+// Include Reader class with error stack for safer memory reading
+#include "exr_reader.hh"
+
 // https://stackoverflow.com/questions/5047971/how-do-i-check-for-c11-support
 #if __cplusplus > 199711L || (defined(_MSC_VER) && _MSC_VER >= 1900)
 #define TINYEXR_HAS_CXX11 (1)
@@ -8844,6 +8847,71 @@ int ParseEXRMultipartHeaderFromFile(EXRHeader ***exr_headers, int *num_headers,
       exr_headers, num_headers, exr_version, file.data, file.size, err);
 }
 
+// ========================================================================
+// Refactored loader functions using Reader class for safer memory access
+// ========================================================================
+
+namespace {  // anonymous namespace for internal helpers
+
+// Parse EXR version header using Reader class
+static int ParseEXRVersionWithReader(EXRVersion *version, tinyexr::Reader& reader) {
+  if (version == NULL) {
+    return TINYEXR_ERROR_INVALID_ARGUMENT;
+  }
+
+  if (reader.length() < tinyexr::kEXRVersionSize) {
+    reader.add_error("Insufficient data size for EXR version header");
+    return TINYEXR_ERROR_INVALID_DATA;
+  }
+
+  // Check magic number: 0x76, 0x2f, 0x31, 0x01
+  uint8_t header[4];
+  if (!reader.read(4, header)) {
+    return TINYEXR_ERROR_INVALID_DATA;
+  }
+
+  const uint8_t expected_header[] = {0x76, 0x2f, 0x31, 0x01};
+  if (header[0] != expected_header[0] || header[1] != expected_header[1] ||
+      header[2] != expected_header[2] || header[3] != expected_header[3]) {
+    reader.add_error("Invalid EXR magic number");
+    return TINYEXR_ERROR_INVALID_MAGIC_NUMBER;
+  }
+
+  // Parse version byte (must be 2)
+  uint8_t version_byte;
+  if (!reader.read1(&version_byte)) {
+    return TINYEXR_ERROR_INVALID_DATA;
+  }
+
+  if (version_byte != 2) {
+    reader.add_error("Invalid EXR version");
+    return TINYEXR_ERROR_INVALID_EXR_VERSION;
+  }
+
+  version->version = 2;
+
+  // Parse flags byte
+  uint8_t flags;
+  if (!reader.read1(&flags)) {
+    return TINYEXR_ERROR_INVALID_DATA;
+  }
+
+  version->tiled = (flags & 0x2) ? true : false;       // 9th bit
+  version->long_name = (flags & 0x4) ? true : false;   // 10th bit
+  version->non_image = (flags & 0x8) ? true : false;   // 11th bit (deep image)
+  version->multipart = (flags & 0x10) ? true : false;  // 12th bit
+
+  // Skip remaining 2 bytes to complete the 8-byte version header
+  uint8_t dummy[2];
+  if (!reader.read(2, dummy)) {
+    return TINYEXR_ERROR_INVALID_DATA;
+  }
+
+  return TINYEXR_SUCCESS;
+}
+
+}  // anonymous namespace
+
 int ParseEXRVersionFromMemory(EXRVersion *version, const unsigned char *memory,
                               size_t size) {
   if (version == NULL || memory == NULL) {
@@ -8854,51 +8922,13 @@ int ParseEXRVersionFromMemory(EXRVersion *version, const unsigned char *memory,
     return TINYEXR_ERROR_INVALID_DATA;
   }
 
-  const unsigned char *marker = memory;
+  // Use Reader class for safer memory access
+  tinyexr::Reader reader(memory, size, tinyexr::Endian::Little);
+  int ret = ParseEXRVersionWithReader(version, reader);
 
-  // Header check.
-  {
-    const char header[] = {0x76, 0x2f, 0x31, 0x01};
-
-    if (memcmp(marker, header, 4) != 0) {
-      return TINYEXR_ERROR_INVALID_MAGIC_NUMBER;
-    }
-    marker += 4;
-  }
-
-  version->tiled = false;
-  version->long_name = false;
-  version->non_image = false;
-  version->multipart = false;
-
-  // Parse version header.
-  {
-    // must be 2
-    if (marker[0] != 2) {
-      return TINYEXR_ERROR_INVALID_EXR_VERSION;
-    }
-
-    if (version == NULL) {
-      return TINYEXR_SUCCESS;  // May OK
-    }
-
-    version->version = 2;
-
-    if (marker[1] & 0x2) {  // 9th bit
-      version->tiled = true;
-    }
-    if (marker[1] & 0x4) {  // 10th bit
-      version->long_name = true;
-    }
-    if (marker[1] & 0x8) {        // 11th bit
-      version->non_image = true;  // (deep image)
-    }
-    if (marker[1] & 0x10) {  // 12th bit
-      version->multipart = true;
-    }
-  }
-
-  return TINYEXR_SUCCESS;
+  // Note: errors are accumulated in reader.errors() but not propagated
+  // to maintain compatibility with existing API
+  return ret;
 }
 
 int ParseEXRVersionFromFile(EXRVersion *version, const char *filename) {
