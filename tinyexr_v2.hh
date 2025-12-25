@@ -23,6 +23,11 @@
 #include "streamreader.hh"
 #include "streamwriter.hh"
 
+// SIMD optimizations (optional, define TINYEXR_ENABLE_SIMD=1 to enable)
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+#include "tinyexr_simd.hh"
+#endif
+
 namespace tinyexr {
 namespace v2 {
 
@@ -745,6 +750,152 @@ Result<void> WriteHeader(Writer& writer, const Header& header);
 
 // Save image data to memory (simplified API)
 Result<std::vector<uint8_t>> SaveToMemory(const ImageData& image);
+
+// ============================================================================
+// Pixel Processing Utilities (with SIMD optimization when enabled)
+// ============================================================================
+
+// Convert half-precision (FP16) array to single-precision (FP32)
+// Uses SIMD when TINYEXR_ENABLE_SIMD is defined
+inline void ConvertHalfToFloat(const uint16_t* half_data, float* float_data, size_t count) {
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+  tinyexr::simd::half_to_float_batch(half_data, float_data, count);
+#else
+  // Scalar fallback (same algorithm as tinyexr.h)
+  for (size_t i = 0; i < count; i++) {
+    uint16_t h = half_data[i];
+    union { uint32_t u; float f; } o;
+    static const union { uint32_t u; float f; } magic = {113U << 23};
+    static const uint32_t shifted_exp = 0x7c00U << 13;
+
+    o.u = (h & 0x7fffU) << 13U;
+    uint32_t exp_ = shifted_exp & o.u;
+    o.u += (127 - 15) << 23;
+
+    if (exp_ == shifted_exp) {
+      o.u += (128 - 16) << 23;
+    } else if (exp_ == 0) {
+      o.u += 1 << 23;
+      o.f -= magic.f;
+    }
+
+    o.u |= (h & 0x8000U) << 16U;
+    float_data[i] = o.f;
+  }
+#endif
+}
+
+// Convert single-precision (FP32) array to half-precision (FP16)
+// Uses SIMD when TINYEXR_ENABLE_SIMD is defined
+inline void ConvertFloatToHalf(const float* float_data, uint16_t* half_data, size_t count) {
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+  tinyexr::simd::float_to_half_batch(float_data, half_data, count);
+#else
+  // Scalar fallback
+  for (size_t i = 0; i < count; i++) {
+    float f = float_data[i];
+    union {
+      float f;
+      uint32_t u;
+      struct {
+        uint32_t Mantissa : 23;
+        uint32_t Exponent : 8;
+        uint32_t Sign : 1;
+      } s;
+    } fi;
+    fi.f = f;
+
+    union {
+      uint16_t u;
+      struct {
+        uint16_t Mantissa : 10;
+        uint16_t Exponent : 5;
+        uint16_t Sign : 1;
+      } s;
+    } o;
+    o.u = 0;
+
+    if (fi.s.Exponent == 0) {
+      o.s.Exponent = 0;
+    } else if (fi.s.Exponent == 255) {
+      o.s.Exponent = 31;
+      o.s.Mantissa = fi.s.Mantissa ? 0x200 : 0;
+    } else {
+      int newexp = static_cast<int>(fi.s.Exponent) - 127 + 15;
+      if (newexp >= 31) {
+        o.s.Exponent = 31;
+      } else if (newexp <= 0) {
+        if ((14 - newexp) <= 24) {
+          uint32_t mant = fi.s.Mantissa | 0x800000;
+          o.s.Mantissa = static_cast<uint16_t>(mant >> (14 - newexp));
+          if ((mant >> (13 - newexp)) & 1) {
+            o.u++;
+          }
+        }
+      } else {
+        o.s.Exponent = static_cast<uint16_t>(newexp);
+        o.s.Mantissa = static_cast<uint16_t>(fi.s.Mantissa >> 13);
+        if (fi.s.Mantissa & 0x1000) {
+          o.u++;
+        }
+      }
+    }
+
+    o.s.Sign = static_cast<uint16_t>(fi.s.Sign);
+    half_data[i] = o.u;
+  }
+#endif
+}
+
+// Interleave separate channel arrays into interleaved RGBA format
+// Input: 4 separate float arrays (R, G, B, A), each of length 'pixel_count'
+// Output: Interleaved RGBA array of length 'pixel_count * 4'
+inline void InterleaveRGBA(const float* r, const float* g, const float* b, const float* a,
+                           float* rgba, size_t pixel_count) {
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+  tinyexr::simd::interleave_rgba_float(r, g, b, a, rgba, pixel_count);
+#else
+  for (size_t i = 0; i < pixel_count; i++) {
+    rgba[i * 4 + 0] = r[i];
+    rgba[i * 4 + 1] = g[i];
+    rgba[i * 4 + 2] = b[i];
+    rgba[i * 4 + 3] = a[i];
+  }
+#endif
+}
+
+// Deinterleave RGBA format into separate channel arrays
+inline void DeinterleaveRGBA(const float* rgba, float* r, float* g, float* b, float* a,
+                             size_t pixel_count) {
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+  tinyexr::simd::deinterleave_rgba_float(rgba, r, g, b, a, pixel_count);
+#else
+  for (size_t i = 0; i < pixel_count; i++) {
+    r[i] = rgba[i * 4 + 0];
+    g[i] = rgba[i * 4 + 1];
+    b[i] = rgba[i * 4 + 2];
+    a[i] = rgba[i * 4 + 3];
+  }
+#endif
+}
+
+// Get SIMD capability information string
+inline const char* GetSIMDInfo() {
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+  return tinyexr::simd::get_simd_info();
+#else
+  return "Scalar (SIMD disabled)";
+#endif
+}
+
+// Check if SIMD is enabled at compile time
+inline bool IsSIMDEnabled() {
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+  return true;
+#else
+  return false;
+#endif
+}
 
 }  // namespace v2
 }  // namespace tinyexr

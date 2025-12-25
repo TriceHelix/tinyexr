@@ -569,3 +569,195 @@ TEST_CASE("v2 API: Feature completeness", "[Summary]") {
 
   REQUIRE(true);  // This test always passes, just for documentation
 }
+
+// ============================================================================
+// SIMD Optimized Pixel Processing Tests
+// ============================================================================
+
+TEST_CASE("v2: ConvertHalfToFloat", "[SIMD][Conversion]") {
+  INFO("SIMD Backend: " << tinyexr::v2::GetSIMDInfo());
+  INFO("SIMD Enabled: " << (tinyexr::v2::IsSIMDEnabled() ? "yes" : "no"));
+
+  SECTION("Basic conversion") {
+    // Test known half-float values
+    // 0x3C00 = 1.0f, 0x4000 = 2.0f, 0x3800 = 0.5f
+    std::vector<uint16_t> half_values = {0x3C00, 0x4000, 0x3800, 0x0000};
+    std::vector<float> expected = {1.0f, 2.0f, 0.5f, 0.0f};
+    std::vector<float> result(4);
+
+    tinyexr::v2::ConvertHalfToFloat(half_values.data(), result.data(), 4);
+
+    for (size_t i = 0; i < 4; i++) {
+      REQUIRE(std::fabs(result[i] - expected[i]) < 0.001f);
+    }
+  }
+
+  SECTION("Batch conversion") {
+    const size_t count = 256;
+    std::vector<uint16_t> half_data(count, 0x3C00);  // All 1.0f
+    std::vector<float> float_data(count);
+
+    tinyexr::v2::ConvertHalfToFloat(half_data.data(), float_data.data(), count);
+
+    for (size_t i = 0; i < count; i++) {
+      REQUIRE(std::fabs(float_data[i] - 1.0f) < 0.001f);
+    }
+  }
+}
+
+TEST_CASE("v2: ConvertFloatToHalf", "[SIMD][Conversion]") {
+  SECTION("Basic conversion") {
+    std::vector<float> float_values = {1.0f, 2.0f, 0.5f, 0.0f};
+    std::vector<uint16_t> expected = {0x3C00, 0x4000, 0x3800, 0x0000};
+    std::vector<uint16_t> result(4);
+
+    tinyexr::v2::ConvertFloatToHalf(float_values.data(), result.data(), 4);
+
+    for (size_t i = 0; i < 4; i++) {
+      // Allow +/- 1 due to rounding
+      int diff = static_cast<int>(result[i]) - static_cast<int>(expected[i]);
+      REQUIRE(std::abs(diff) <= 1);
+    }
+  }
+
+  SECTION("Batch conversion") {
+    const size_t count = 256;
+    std::vector<float> float_data(count, 1.0f);
+    std::vector<uint16_t> half_data(count);
+
+    tinyexr::v2::ConvertFloatToHalf(float_data.data(), half_data.data(), count);
+
+    for (size_t i = 0; i < count; i++) {
+      // 0x3C00 = 1.0f in half
+      REQUIRE(half_data[i] == 0x3C00);
+    }
+  }
+}
+
+TEST_CASE("v2: FP16 Round-trip", "[SIMD][Conversion]") {
+  SECTION("Common values") {
+    std::vector<float> original = {0.0f, 1.0f, -1.0f, 0.5f, 2.0f, 100.0f, -50.0f};
+    std::vector<uint16_t> half_data(original.size());
+    std::vector<float> restored(original.size());
+
+    tinyexr::v2::ConvertFloatToHalf(original.data(), half_data.data(), original.size());
+    tinyexr::v2::ConvertHalfToFloat(half_data.data(), restored.data(), original.size());
+
+    for (size_t i = 0; i < original.size(); i++) {
+      // Half precision has ~3 decimal digits of precision
+      float tolerance = std::fabs(original[i]) * 0.002f + 0.001f;
+      REQUIRE(std::fabs(restored[i] - original[i]) < tolerance);
+    }
+  }
+
+  SECTION("Large batch") {
+    const size_t count = 1024;
+    std::vector<float> original(count);
+    std::vector<uint16_t> half_data(count);
+    std::vector<float> restored(count);
+
+    // Fill with various values
+    for (size_t i = 0; i < count; i++) {
+      original[i] = static_cast<float>(i) / 10.0f - 50.0f;
+    }
+
+    tinyexr::v2::ConvertFloatToHalf(original.data(), half_data.data(), count);
+    tinyexr::v2::ConvertHalfToFloat(half_data.data(), restored.data(), count);
+
+    for (size_t i = 0; i < count; i++) {
+      float tolerance = std::fabs(original[i]) * 0.002f + 0.01f;
+      REQUIRE(std::fabs(restored[i] - original[i]) < tolerance);
+    }
+  }
+}
+
+TEST_CASE("v2: InterleaveRGBA", "[SIMD][Interleave]") {
+  SECTION("Basic interleave") {
+    const size_t count = 4;
+    std::vector<float> r = {1.0f, 2.0f, 3.0f, 4.0f};
+    std::vector<float> g = {0.1f, 0.2f, 0.3f, 0.4f};
+    std::vector<float> b = {0.01f, 0.02f, 0.03f, 0.04f};
+    std::vector<float> a = {1.0f, 1.0f, 1.0f, 1.0f};
+    std::vector<float> rgba(count * 4);
+
+    tinyexr::v2::InterleaveRGBA(r.data(), g.data(), b.data(), a.data(), rgba.data(), count);
+
+    for (size_t i = 0; i < count; i++) {
+      REQUIRE(rgba[i * 4 + 0] == r[i]);
+      REQUIRE(rgba[i * 4 + 1] == g[i]);
+      REQUIRE(rgba[i * 4 + 2] == b[i]);
+      REQUIRE(rgba[i * 4 + 3] == a[i]);
+    }
+  }
+
+  SECTION("Large batch") {
+    const size_t count = 256;
+    std::vector<float> r(count), g(count), b(count), a(count);
+    std::vector<float> rgba(count * 4);
+
+    for (size_t i = 0; i < count; i++) {
+      r[i] = static_cast<float>(i);
+      g[i] = static_cast<float>(count - i);
+      b[i] = static_cast<float>(i * 2 % count);
+      a[i] = 1.0f;
+    }
+
+    tinyexr::v2::InterleaveRGBA(r.data(), g.data(), b.data(), a.data(), rgba.data(), count);
+
+    for (size_t i = 0; i < count; i++) {
+      REQUIRE(rgba[i * 4 + 0] == r[i]);
+      REQUIRE(rgba[i * 4 + 1] == g[i]);
+      REQUIRE(rgba[i * 4 + 2] == b[i]);
+      REQUIRE(rgba[i * 4 + 3] == a[i]);
+    }
+  }
+}
+
+TEST_CASE("v2: DeinterleaveRGBA", "[SIMD][Interleave]") {
+  SECTION("Basic deinterleave") {
+    const size_t count = 4;
+    std::vector<float> rgba = {
+      1.0f, 0.1f, 0.01f, 1.0f,
+      2.0f, 0.2f, 0.02f, 1.0f,
+      3.0f, 0.3f, 0.03f, 1.0f,
+      4.0f, 0.4f, 0.04f, 1.0f
+    };
+    std::vector<float> r(count), g(count), b(count), a(count);
+
+    tinyexr::v2::DeinterleaveRGBA(rgba.data(), r.data(), g.data(), b.data(), a.data(), count);
+
+    REQUIRE(r[0] == 1.0f);
+    REQUIRE(r[1] == 2.0f);
+    REQUIRE(r[2] == 3.0f);
+    REQUIRE(r[3] == 4.0f);
+
+    REQUIRE(g[0] == Approx(0.1f));
+    REQUIRE(g[1] == Approx(0.2f));
+    REQUIRE(g[2] == Approx(0.3f));
+    REQUIRE(g[3] == Approx(0.4f));
+  }
+
+  SECTION("Round-trip") {
+    const size_t count = 256;
+    std::vector<float> r(count), g(count), b(count), a(count);
+    std::vector<float> rgba(count * 4);
+    std::vector<float> r2(count), g2(count), b2(count), a2(count);
+
+    for (size_t i = 0; i < count; i++) {
+      r[i] = static_cast<float>(i) / count;
+      g[i] = static_cast<float>(count - i) / count;
+      b[i] = static_cast<float>(i * 2 % count) / count;
+      a[i] = 1.0f;
+    }
+
+    tinyexr::v2::InterleaveRGBA(r.data(), g.data(), b.data(), a.data(), rgba.data(), count);
+    tinyexr::v2::DeinterleaveRGBA(rgba.data(), r2.data(), g2.data(), b2.data(), a2.data(), count);
+
+    for (size_t i = 0; i < count; i++) {
+      REQUIRE(r2[i] == r[i]);
+      REQUIRE(g2[i] == g[i]);
+      REQUIRE(b2[i] == b[i]);
+      REQUIRE(a2[i] == a[i]);
+    }
+  }
+}
