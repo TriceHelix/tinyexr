@@ -26,6 +26,7 @@
 // SIMD optimizations (optional, define TINYEXR_ENABLE_SIMD=1 to enable)
 #if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
 #include "tinyexr_simd.hh"
+#include "tinyexr_huffman.hh"
 #endif
 
 namespace tinyexr {
@@ -893,6 +894,47 @@ inline bool IsSIMDEnabled() {
 #if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
   return true;
 #else
+  return false;
+#endif
+}
+
+// ============================================================================
+// Compression/Decompression Utilities (with optimizations when enabled)
+// ============================================================================
+
+// Get Huffman/bit manipulation backend info
+inline const char* GetHuffmanInfo() {
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+  return tinyexr::huffman::get_huffman_info();
+#else
+  return "Scalar (SIMD disabled)";
+#endif
+}
+
+// Decompress deflate data (raw deflate, no zlib header)
+// Returns true on success, false on error
+// dst_len should be set to the output buffer size on input,
+// and will be set to the actual decompressed size on output
+inline bool DecompressDeflate(const uint8_t* src, size_t src_len,
+                              uint8_t* dst, size_t* dst_len) {
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+  return tinyexr::huffman::inflate(src, src_len, dst, dst_len);
+#else
+  // Fallback: not implemented without SIMD
+  // In production, this would call miniz or zlib
+  (void)src; (void)src_len; (void)dst; (void)dst_len;
+  return false;
+#endif
+}
+
+// Decompress zlib data (with 2-byte header)
+inline bool DecompressZlib(const uint8_t* src, size_t src_len,
+                          uint8_t* dst, size_t* dst_len) {
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+  return tinyexr::huffman::inflate_zlib(src, src_len, dst, dst_len);
+#else
+  // Fallback: not implemented without SIMD
+  (void)src; (void)src_len; (void)dst; (void)dst_len;
   return false;
 #endif
 }
