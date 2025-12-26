@@ -594,12 +594,8 @@ inline bool hufBuildDecTable(const int64_t* hcode, int im, int iM,
   if (iM < 0 || iM >= HUF_ENCSIZE) return false;
   if (im > iM) return false;
 
-  // Clear table
-  for (int i = 0; i < HUF_DECSIZE; i++) {
-    hdecod[i].len = 0;
-    hdecod[i].lit = 0;
-    hdecod[i].p = nullptr;
-  }
+  // Clear table (use memset for efficiency)
+  std::memset(hdecod, 0, sizeof(HufDec) * HUF_DECSIZE);
 
   // Pass 1: Collect long codes per table index
   std::vector<std::vector<int>> long_code_lists(HUF_DECSIZE);
@@ -835,6 +831,10 @@ inline bool hufDecode(const int64_t* hcode, const HufDec* hdecod,
         const int numCandidates = pl.lit;
 
         for (int j = 0; j < numCandidates; j++) {
+          // Prefetch next candidate's code entry
+          if (j + 1 < numCandidates) {
+            PIZ_PREFETCH(&hcode[pl.p[j + 1]]);
+          }
           const int sym = pl.p[j];
           if (PIZ_UNLIKELY(sym < 0 || sym >= HUF_ENCSIZE)) {
             if (debug) fprintf(stderr, "Invalid symbol in long code list\n");
@@ -1221,7 +1221,20 @@ inline tinyexr::v2::Result<void> DecompressPizV2(
   }
 
   // Set up channel data for wavelet decode
-  std::vector<PIZChannelData> channelData(static_cast<size_t>(numChannels));
+  // Use stack allocation for common cases (up to 16 channels)
+  constexpr size_t kMaxStackChannels = 16;
+  PIZChannelData channelDataStack[kMaxStackChannels];
+  std::vector<PIZChannelData> channelDataVec;
+  PIZChannelData* channelData;
+  const size_t numChan = static_cast<size_t>(numChannels);
+
+  if (numChan <= kMaxStackChannels) {
+    channelData = channelDataStack;
+  } else {
+    channelDataVec.resize(numChan);
+    channelData = channelDataVec.data();
+  }
+
   uint16_t* tmpBufferEnd = tmpBuffer.data();
   uint16_t* tmpBufferLimit = tmpBuffer.data() + tmpBufSize;
 
@@ -1255,7 +1268,7 @@ inline tinyexr::v2::Result<void> DecompressPizV2(
   }
 
   // Wavelet decode each channel (with bounds checking)
-  for (size_t i = 0; i < channelData.size(); ++i) {
+  for (size_t i = 0; i < numChan; ++i) {
     PIZChannelData& cd = channelData[i];
 
     // Calculate buffer size for this channel
@@ -1288,7 +1301,7 @@ inline tinyexr::v2::Result<void> DecompressPizV2(
   uint8_t* outLimit = dst + dstSize;
 
   for (int y = 0; y < numLines; y++) {
-    for (size_t i = 0; i < channelData.size(); ++i) {
+    for (size_t i = 0; i < numChan; ++i) {
       PIZChannelData& cd = channelData[i];
       size_t n = static_cast<size_t>(cd.nx * cd.size);
       size_t copyBytes = n * sizeof(uint16_t);

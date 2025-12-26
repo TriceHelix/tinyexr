@@ -1286,8 +1286,42 @@ private:
       return;
     }
 
-    // For all other overlapping cases (distance 2-15), use byte-by-byte copy
-    // This is the safest approach for correctness
+    // Optimized pattern copy for small distances
+    if (distance == 2 && length >= 4) {
+      // Repeat 2-byte pattern
+      uint16_t pattern;
+      std::memcpy(&pattern, src, 2);
+      while (length >= 8) {
+        uint16_t* d16 = reinterpret_cast<uint16_t*>(dst);
+        d16[0] = pattern; d16[1] = pattern; d16[2] = pattern; d16[3] = pattern;
+        dst += 8;
+        length -= 8;
+      }
+      while (length >= 2) {
+        std::memcpy(dst, &pattern, 2);
+        dst += 2;
+        length -= 2;
+      }
+      src = dst - distance;  // Update src for remainder
+    } else if (distance == 4 && length >= 8) {
+      // Repeat 4-byte pattern
+      uint32_t pattern;
+      std::memcpy(&pattern, src, 4);
+      while (length >= 16) {
+        uint32_t* d32 = reinterpret_cast<uint32_t*>(dst);
+        d32[0] = pattern; d32[1] = pattern; d32[2] = pattern; d32[3] = pattern;
+        dst += 16;
+        length -= 16;
+      }
+      while (length >= 4) {
+        std::memcpy(dst, &pattern, 4);
+        dst += 4;
+        length -= 4;
+      }
+      src = dst - distance;  // Update src for remainder
+    }
+
+    // For remaining overlapping cases, use byte-by-byte copy
     while (length-- > 0) {
       *dst++ = *src++;
     }
