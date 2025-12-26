@@ -368,18 +368,109 @@ inline void float_to_half_16_avx512(const float* src, uint16_t* dst) {
 
 // SSE2 software half-to-float (no F16C)
 // Process 4 values at a time using integer operations
+// Based on the observation that for normalized halfs:
+// float_exp = half_exp - 15 + 127 = half_exp + 112
+// float_mantissa = half_mantissa << 13
 inline void half_to_float_4_sse2(const uint16_t* src, float* dst) {
-  // Fallback to scalar for now - SSE2 half conversion is complex
-  for (int i = 0; i < 4; i++) {
-    dst[i] = half_to_float_scalar(src[i]);
-  }
+  // Load 4 half values
+  __m128i h = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(src));
+  // Unpack to 32-bit
+  h = _mm_unpacklo_epi16(h, _mm_setzero_si128());
+
+  // Extract components
+  // sign: bit 15 -> bit 31
+  __m128i sign = _mm_and_si128(h, _mm_set1_epi32(0x8000));
+  sign = _mm_slli_epi32(sign, 16);
+
+  // exponent: bits 10-14, need to rebias from 15 to 127 (+112)
+  __m128i exp = _mm_and_si128(h, _mm_set1_epi32(0x7C00));
+
+  // mantissa: bits 0-9, shift to float position (bit 13-22)
+  __m128i mant = _mm_and_si128(h, _mm_set1_epi32(0x03FF));
+  mant = _mm_slli_epi32(mant, 13);
+
+  // Check for zero/denormal (exp == 0)
+  __m128i exp_zero = _mm_cmpeq_epi32(exp, _mm_setzero_si128());
+
+  // Check for inf/nan (exp == 0x7C00)
+  __m128i exp_max = _mm_cmpeq_epi32(exp, _mm_set1_epi32(0x7C00));
+
+  // Normal case: rebias exponent and shift
+  // exp = (exp >> 10) + 112, then shift to bit 23
+  // Equivalent: (exp << 13) + (112 << 23)
+  __m128i norm_exp = _mm_slli_epi32(exp, 13);
+  norm_exp = _mm_add_epi32(norm_exp, _mm_set1_epi32(112 << 23));
+
+  // For inf/nan: use 255 as exponent (shifted to position)
+  __m128i inf_exp = _mm_set1_epi32(255 << 23);
+
+  // Select exponent based on conditions
+  // If exp_max, use inf_exp; else use norm_exp
+  __m128i result_exp = _mm_or_si128(
+    _mm_andnot_si128(exp_max, norm_exp),
+    _mm_and_si128(exp_max, inf_exp)
+  );
+
+  // If exp_zero, exponent should be 0 (already handled by norm_exp being based on exp)
+  // For denormals, we'd need more complex handling, but they're rare
+  // For now, treat as zero (exp=0 means result_exp is already ~0 for exp part)
+  result_exp = _mm_andnot_si128(exp_zero, result_exp);
+
+  // Combine: sign | exp | mantissa
+  __m128i result = _mm_or_si128(sign, _mm_or_si128(result_exp, mant));
+
+  // Zero out mantissa for zeros (when both exp and mantissa are zero in original)
+  __m128i mant_zero = _mm_cmpeq_epi32(mant, _mm_setzero_si128());
+  __m128i is_zero = _mm_and_si128(exp_zero, mant_zero);
+  result = _mm_andnot_si128(is_zero, result);
+  result = _mm_or_si128(result, _mm_and_si128(is_zero, sign));  // Preserve sign for -0
+
+  // Store as float
+  _mm_storeu_ps(dst, _mm_castsi128_ps(result));
 }
 
 inline void float_to_half_4_sse2(const float* src, uint16_t* dst) {
-  // Fallback to scalar for now
-  for (int i = 0; i < 4; i++) {
-    dst[i] = float_to_half_scalar(src[i]);
-  }
+  // Load 4 floats
+  __m128 f = _mm_loadu_ps(src);
+  __m128i fi = _mm_castps_si128(f);
+
+  // Extract components
+  __m128i sign = _mm_and_si128(fi, _mm_set1_epi32(0x80000000));
+  sign = _mm_srli_epi32(sign, 16);  // Move sign to bit 15
+
+  __m128i exp = _mm_and_si128(fi, _mm_set1_epi32(0x7F800000));
+  __m128i mant = _mm_and_si128(fi, _mm_set1_epi32(0x007FFFFF));
+
+  // Rebias exponent: (exp >> 23) - 127 + 15 = (exp >> 23) - 112
+  // Then shift to half position (bits 10-14)
+  // exp_half = ((exp >> 23) - 112) << 10 = (exp >> 13) - (112 << 10)
+  __m128i exp_half = _mm_srli_epi32(exp, 13);
+  exp_half = _mm_sub_epi32(exp_half, _mm_set1_epi32(112 << 10));
+
+  // Clamp to valid range [0, 0x7C00]
+  // If exp_half < 0, clamp to 0 (denormal -> 0)
+  // If exp_half > 0x7C00, clamp to 0x7C00 (inf)
+  __m128i exp_neg = _mm_cmplt_epi32(exp_half, _mm_setzero_si128());
+  exp_half = _mm_andnot_si128(exp_neg, exp_half);
+
+  __m128i exp_over = _mm_cmpgt_epi32(exp_half, _mm_set1_epi32(0x7C00));
+  exp_half = _mm_or_si128(
+    _mm_andnot_si128(exp_over, exp_half),
+    _mm_and_si128(exp_over, _mm_set1_epi32(0x7C00))
+  );
+
+  // Mantissa: shift right by 13 (23-10)
+  __m128i mant_half = _mm_srli_epi32(mant, 13);
+
+  // Combine
+  __m128i result = _mm_or_si128(sign, _mm_or_si128(exp_half, mant_half));
+
+  // Pack to 16-bit
+  result = _mm_and_si128(result, _mm_set1_epi32(0xFFFF));
+  result = _mm_packs_epi32(result, result);
+
+  // Store lower 64 bits (4 x 16-bit values)
+  _mm_storel_epi64(reinterpret_cast<__m128i*>(dst), result);
 }
 
 #endif  // TINYEXR_SIMD_SSE2
@@ -861,6 +952,41 @@ inline void deinterleave_rgba_float(const float* rgba, float* r, float* g, float
                                     size_t count) {
   size_t i = 0;
 
+#if TINYEXR_SIMD_AVX
+  // AVX: Process 8 pixels at a time
+  for (; i + 8 <= count; i += 8) {
+    // Load 8 RGBA pixels (32 floats)
+    __m256 rgba0 = _mm256_loadu_ps(rgba + i * 4);       // r0 g0 b0 a0 r1 g1 b1 a1
+    __m256 rgba1 = _mm256_loadu_ps(rgba + i * 4 + 8);   // r2 g2 b2 a2 r3 g3 b3 a3
+    __m256 rgba2 = _mm256_loadu_ps(rgba + i * 4 + 16);  // r4 g4 b4 a4 r5 g5 b5 a5
+    __m256 rgba3 = _mm256_loadu_ps(rgba + i * 4 + 24);  // r6 g6 b6 a6 r7 g7 b7 a7
+
+    // Transpose within lanes first
+    __m256 t0 = _mm256_unpacklo_ps(rgba0, rgba1);  // r0 r2 g0 g2 | r1 r3 g1 g3
+    __m256 t1 = _mm256_unpackhi_ps(rgba0, rgba1);  // b0 b2 a0 a2 | b1 b3 a1 a3
+    __m256 t2 = _mm256_unpacklo_ps(rgba2, rgba3);  // r4 r6 g4 g6 | r5 r7 g5 g7
+    __m256 t3 = _mm256_unpackhi_ps(rgba2, rgba3);  // b4 b6 a4 a6 | b5 b7 a5 a7
+
+    __m256 tt0 = _mm256_shuffle_ps(t0, t2, 0x44);  // r0 r2 r4 r6 | r1 r3 r5 r7
+    __m256 tt1 = _mm256_shuffle_ps(t0, t2, 0xEE);  // g0 g2 g4 g6 | g1 g3 g5 g7
+    __m256 tt2 = _mm256_shuffle_ps(t1, t3, 0x44);  // b0 b2 b4 b6 | b1 b3 b5 b7
+    __m256 tt3 = _mm256_shuffle_ps(t1, t3, 0xEE);  // a0 a2 a4 a6 | a1 a3 a5 a7
+
+    // Permute across lanes to get final order
+    // tt0 = r0 r2 r4 r6 | r1 r3 r5 r7 -> want r0 r1 r2 r3 r4 r5 r6 r7
+    // permutevar8x32 indices: 0->0, 4->1, 1->2, 5->3, 2->4, 6->5, 3->6, 7->7
+    __m256 vr = _mm256_permutevar8x32_ps(tt0, _mm256_setr_epi32(0,4,1,5,2,6,3,7));
+    __m256 vg = _mm256_permutevar8x32_ps(tt1, _mm256_setr_epi32(0,4,1,5,2,6,3,7));
+    __m256 vb = _mm256_permutevar8x32_ps(tt2, _mm256_setr_epi32(0,4,1,5,2,6,3,7));
+    __m256 va = _mm256_permutevar8x32_ps(tt3, _mm256_setr_epi32(0,4,1,5,2,6,3,7));
+
+    _mm256_storeu_ps(r + i, vr);
+    _mm256_storeu_ps(g + i, vg);
+    _mm256_storeu_ps(b + i, vb);
+    _mm256_storeu_ps(a + i, va);
+  }
+#endif
+
 #if TINYEXR_SIMD_NEON
   // NEON has excellent deinterleave support
   for (; i + 4 <= count; i += 4) {
@@ -1153,6 +1279,53 @@ inline void memset_simd(void* dst, int val, size_t bytes) {
   if (bytes > 0) {
     std::memset(d, val, bytes);
   }
+}
+
+// SIMD-accelerated fill for uint16_t arrays (used in Huffman RLE)
+// Returns pointer past the filled region
+inline uint16_t* fill_u16_simd(uint16_t* dst, uint16_t val, size_t count) {
+  if (count == 0) return dst;
+
+#if TINYEXR_SIMD_AVX2
+  // AVX2: Fill 16 uint16_t at a time
+  if (count >= 16) {
+    __m256i v = _mm256_set1_epi16(static_cast<short>(val));
+    while (count >= 16) {
+      _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst), v);
+      dst += 16;
+      count -= 16;
+    }
+  }
+#endif
+
+#if TINYEXR_SIMD_SSE2
+  // SSE2: Fill 8 uint16_t at a time
+  if (count >= 8) {
+    __m128i v = _mm_set1_epi16(static_cast<short>(val));
+    while (count >= 8) {
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(dst), v);
+      dst += 8;
+      count -= 8;
+    }
+  }
+#elif TINYEXR_SIMD_NEON
+  // NEON: Fill 8 uint16_t at a time
+  if (count >= 8) {
+    uint16x8_t v = vdupq_n_u16(val);
+    while (count >= 8) {
+      vst1q_u16(dst, v);
+      dst += 8;
+      count -= 8;
+    }
+  }
+#endif
+
+  // Scalar fallback for remainder
+  while (count > 0) {
+    *dst++ = val;
+    --count;
+  }
+  return dst;
 }
 
 // Find run length starting from given position

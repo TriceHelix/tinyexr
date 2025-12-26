@@ -139,13 +139,13 @@ inline uint16_t reverseLutFromBitmap(const uint8_t* bitmap, uint16_t* lut) {
 // Returns true on success, false if parameters are invalid
 inline bool applyLut(const uint16_t* lut, uint16_t* data, int nData, size_t lutSize = USHORT_RANGE) {
   // Validate input parameters
-  if (!lut || !data) return false;
-  if (nData < 0) return false;
-  if (lutSize == 0) return false;
+  if (PIZ_UNLIKELY(!lut || !data)) return false;
+  if (PIZ_UNLIKELY(nData < 0)) return false;
+  if (PIZ_UNLIKELY(lutSize == 0)) return false;
 
 #if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
   // SIMD version uses full 64K LUT, validate size
-  if (lutSize < USHORT_RANGE) {
+  if (PIZ_UNLIKELY(lutSize < USHORT_RANGE)) {
     // Fall back to scalar with bounds check
     for (int i = 0; i < nData; ++i) {
       size_t idx = static_cast<size_t>(data[i]);
@@ -154,8 +154,12 @@ inline bool applyLut(const uint16_t* lut, uint16_t* data, int nData, size_t lutS
     }
     return true;
   }
-  // Use SIMD-optimized LUT application if available
+  // Use AVX2 gather when available, otherwise prefetch version
+#if TINYEXR_SIMD_AVX2
+  tinyexr::simd::apply_lut_avx2(data, static_cast<size_t>(nData), lut);
+#else
   tinyexr::simd::apply_lut_prefetch(data, static_cast<size_t>(nData), lut);
+#endif
 #else
   for (int i = 0; i < nData; ++i) {
     size_t idx = static_cast<size_t>(data[i]);
@@ -728,14 +732,16 @@ PIZ_ALWAYS_INLINE bool hufGetCode(int lit, int rlc, int64_t& c, int& lc,
     if (PIZ_UNLIKELY(out <= outb)) return false;  // Need at least one previous value
     if (PIZ_UNLIKELY(out + run > oe)) return false;  // Would overflow output buffer
 
-    // Optimized RLE fill
+    // Optimized RLE fill using SIMD when available
     uint16_t prev = out[-1];
     if (run > 0) {
-      // Use optimized fill for larger runs
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+      // Use SIMD-accelerated fill for larger runs
+      out = tinyexr::simd::fill_u16_simd(out, prev, static_cast<size_t>(run));
+#else
+      // Scalar fallback with loop unrolling
       if (run >= 8) {
-        // For larger runs, fill in chunks
         uint16_t* end = out + run;
-        // Unroll loop for better performance
         while (out + 8 <= end) {
           out[0] = prev; out[1] = prev; out[2] = prev; out[3] = prev;
           out[4] = prev; out[5] = prev; out[6] = prev; out[7] = prev;
@@ -743,9 +749,9 @@ PIZ_ALWAYS_INLINE bool hufGetCode(int lit, int rlc, int64_t& c, int& lc,
         }
         while (out < end) *out++ = prev;
       } else {
-        // Small runs - simple loop
         while (run-- > 0) *out++ = prev;
       }
+#endif
     }
   } else {
     // Literal value (common path)
