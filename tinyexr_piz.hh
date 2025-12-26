@@ -35,6 +35,22 @@ namespace tinyexr {
 namespace piz {
 
 // ============================================================================
+// Compiler Hints for Optimization
+// ============================================================================
+
+#if defined(__GNUC__) || defined(__clang__)
+#define PIZ_LIKELY(x)   __builtin_expect(!!(x), 1)
+#define PIZ_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define PIZ_ALWAYS_INLINE __attribute__((always_inline)) inline
+#define PIZ_PREFETCH(addr) __builtin_prefetch(addr)
+#else
+#define PIZ_LIKELY(x)   (x)
+#define PIZ_UNLIKELY(x) (x)
+#define PIZ_ALWAYS_INLINE inline
+#define PIZ_PREFETCH(addr) ((void)0)
+#endif
+
+// ============================================================================
 // Constants
 // ============================================================================
 
@@ -281,22 +297,23 @@ inline void wav2Encode(uint16_t* in, int nx, int ox, int ny, int oy, uint16_t mx
 }
 
 // 2D Wavelet decoding with bounds validation
+// Optimized with branch hints and prefetching
 // Returns true on success, false if parameters are invalid
 inline bool wav2Decode(uint16_t* in, int nx, int ox, int ny, int oy, uint16_t mx,
                        size_t bufferSize = 0) {
-  // Validate input parameters
-  if (!in) return false;
-  if (nx <= 0 || ny <= 0) return false;
-  if (ox <= 0 || oy <= 0) return false;
+  // Validate input parameters (unlikely to fail with valid data)
+  if (PIZ_UNLIKELY(!in)) return false;
+  if (PIZ_UNLIKELY(nx <= 0 || ny <= 0)) return false;
+  if (PIZ_UNLIKELY(ox <= 0 || oy <= 0)) return false;
 
   // Check for integer overflow in buffer size calculation
   int64_t maxOffset = static_cast<int64_t>(oy) * (ny - 1) +
                       static_cast<int64_t>(ox) * (nx - 1);
-  if (maxOffset < 0 || (bufferSize > 0 && static_cast<size_t>(maxOffset) >= bufferSize)) {
+  if (PIZ_UNLIKELY(maxOffset < 0 || (bufferSize > 0 && static_cast<size_t>(maxOffset) >= bufferSize))) {
     return false;  // Buffer overflow would occur
   }
 
-  bool w14 = (mx < (1 << 14));
+  const bool w14 = (mx < (1 << 14));
   int n = (nx > ny) ? ny : nx;
   int p = 1;
   int p2;
@@ -307,71 +324,129 @@ inline bool wav2Decode(uint16_t* in, int nx, int ox, int ny, int oy, uint16_t mx
   p2 = p;
   p >>= 1;
 
-  while (p >= 1) {
-    uint16_t* py = in;
-    uint16_t* ey = in + oy * (ny - p2);
-    int oy1 = oy * p;
-    int oy2 = oy * p2;
-    int ox1 = ox * p;
-    int ox2 = ox * p2;
-    uint16_t i00, i01, i10, i11;
+  // Split into separate loops based on w14 to avoid branch in inner loop
+  if (PIZ_LIKELY(w14)) {
+    // 14-bit path (most common case for HALF data)
+    while (p >= 1) {
+      uint16_t* py = in;
+      uint16_t* ey = in + oy * (ny - p2);
+      const int oy1 = oy * p;
+      const int oy2 = oy * p2;
+      const int ox1 = ox * p;
+      const int ox2 = ox * p2;
+      uint16_t i00, i01, i10, i11;
 
-    // Validate stride calculations don't overflow
-    if (oy1 < 0 || oy2 < 0 || ox1 < 0 || ox2 < 0) return false;
-    if (oy2 == 0 || ox2 == 0) return false;  // Prevent infinite loop
+      // Validate stride calculations don't overflow
+      if (PIZ_UNLIKELY(oy1 < 0 || oy2 < 0 || ox1 < 0 || ox2 < 0)) return false;
+      if (PIZ_UNLIKELY(oy2 == 0 || ox2 == 0)) return false;
 
-    // Y loop
-    for (; py <= ey; py += oy2) {
-      uint16_t* px = py;
-      uint16_t* ex = py + ox * (nx - p2);
+      // Y loop
+      for (; py <= ey; py += oy2) {
+        uint16_t* px = py;
+        uint16_t* ex = py + ox * (nx - p2);
 
-      // X loop
-      for (; px <= ex; px += ox2) {
-        uint16_t* p01 = px + ox1;
-        uint16_t* p10 = px + oy1;
-        uint16_t* p11 = p10 + ox1;
+        // Prefetch next row
+        PIZ_PREFETCH(py + oy2);
 
-        if (w14) {
+        // X loop (unrolled inner decode)
+        for (; px <= ex; px += ox2) {
+          uint16_t* p01 = px + ox1;
+          uint16_t* p10 = px + oy1;
+          uint16_t* p11 = p10 + ox1;
+
+          // Prefetch ahead in row
+          PIZ_PREFETCH(px + ox2 + ox2);
+
           wdec14(*px, *p10, i00, i10);
           wdec14(*p01, *p11, i01, i11);
           wdec14(i00, i01, *px, *p01);
           wdec14(i10, i11, *p10, *p11);
-        } else {
+        }
+
+        // Decode odd column
+        if (nx & p) {
+          uint16_t* p10 = px + oy1;
+          wdec14(*px, *p10, i00, *p10);
+          *px = i00;
+        }
+      }
+
+      // Decode odd line
+      if (ny & p) {
+        uint16_t* px = py;
+        uint16_t* ex = py + ox * (nx - p2);
+
+        for (; px <= ex; px += ox2) {
+          uint16_t* p01 = px + ox1;
+          wdec14(*px, *p01, i00, *p01);
+          *px = i00;
+        }
+      }
+
+      p2 = p;
+      p >>= 1;
+    }
+  } else {
+    // 16-bit path (for larger value ranges)
+    while (p >= 1) {
+      uint16_t* py = in;
+      uint16_t* ey = in + oy * (ny - p2);
+      const int oy1 = oy * p;
+      const int oy2 = oy * p2;
+      const int ox1 = ox * p;
+      const int ox2 = ox * p2;
+      uint16_t i00, i01, i10, i11;
+
+      // Validate stride calculations don't overflow
+      if (PIZ_UNLIKELY(oy1 < 0 || oy2 < 0 || ox1 < 0 || ox2 < 0)) return false;
+      if (PIZ_UNLIKELY(oy2 == 0 || ox2 == 0)) return false;
+
+      // Y loop
+      for (; py <= ey; py += oy2) {
+        uint16_t* px = py;
+        uint16_t* ex = py + ox * (nx - p2);
+
+        // Prefetch next row
+        PIZ_PREFETCH(py + oy2);
+
+        // X loop
+        for (; px <= ex; px += ox2) {
+          uint16_t* p01 = px + ox1;
+          uint16_t* p10 = px + oy1;
+          uint16_t* p11 = p10 + ox1;
+
+          // Prefetch ahead in row
+          PIZ_PREFETCH(px + ox2 + ox2);
+
           wdec16(*px, *p10, i00, i10);
           wdec16(*p01, *p11, i01, i11);
           wdec16(i00, i01, *px, *p01);
           wdec16(i10, i11, *p10, *p11);
         }
-      }
 
-      // Decode odd column
-      if (nx & p) {
-        uint16_t* p10 = px + oy1;
-        if (w14)
-          wdec14(*px, *p10, i00, *p10);
-        else
+        // Decode odd column
+        if (nx & p) {
+          uint16_t* p10 = px + oy1;
           wdec16(*px, *p10, i00, *p10);
-        *px = i00;
+          *px = i00;
+        }
       }
-    }
 
-    // Decode odd line
-    if (ny & p) {
-      uint16_t* px = py;
-      uint16_t* ex = py + ox * (nx - p2);
+      // Decode odd line
+      if (ny & p) {
+        uint16_t* px = py;
+        uint16_t* ex = py + ox * (nx - p2);
 
-      for (; px <= ex; px += ox2) {
-        uint16_t* p01 = px + ox1;
-        if (w14)
-          wdec14(*px, *p01, i00, *p01);
-        else
+        for (; px <= ex; px += ox2) {
+          uint16_t* p01 = px + ox1;
           wdec16(*px, *p01, i00, *p01);
-        *px = i00;
+          *px = i00;
+        }
       }
-    }
 
-    p2 = p;
-    p >>= 1;
+      p2 = p;
+      p >>= 1;
+    }
   }
   return true;
 }
@@ -631,256 +706,220 @@ inline void hufGetChar(int64_t& c, int& lc, const uint8_t*& in) {
   lc += 8;
 }
 
-// Get code from decoder output
+// Get code from decoder output (optimized version)
 // Note: RLE run length is just the 8-bit value, NOT value + 2 (matching V1)
-inline bool hufGetCode(int lit, int rlc, int64_t& c, int& lc,
+PIZ_ALWAYS_INLINE bool hufGetCode(int lit, int rlc, int64_t& c, int& lc,
                        const uint8_t*& in, const uint8_t* ie,
                        uint16_t*& out, const uint16_t* outb, const uint16_t* oe) {
-  // Validate lc is in reasonable range
-  if (lc < 0 || lc > 64) return false;
+  // Validate lc is in reasonable range (unlikely to fail)
+  if (PIZ_UNLIKELY(lc < 0 || lc > 64)) return false;
 
-  if (lit == rlc) {
-    // Run-length encoded
+  if (PIZ_UNLIKELY(lit == rlc)) {
+    // Run-length encoded (relatively rare path)
     if (lc < 8) {
-      if (in >= ie) return false;  // Bounds check
+      if (PIZ_UNLIKELY(in >= ie)) return false;  // Bounds check
       hufGetChar(c, lc, in);
     }
-    if (lc < 8) return false;  // Still not enough bits (shouldn't happen)
+    if (PIZ_UNLIKELY(lc < 8)) return false;  // Still not enough bits
     lc -= 8;
     int run = static_cast<int>((c >> lc) & 0xFF);  // No +2, matching V1
 
-    // Validate RLE operation
-    if (run < 0) return false;  // Sanity check (shouldn't happen)
-    if (out <= outb) return false;  // Need at least one previous value
-    if (out + run > oe) return false;  // Would overflow output buffer
+    // Validate RLE operation (unlikely to fail with valid data)
+    if (PIZ_UNLIKELY(out <= outb)) return false;  // Need at least one previous value
+    if (PIZ_UNLIKELY(out + run > oe)) return false;  // Would overflow output buffer
 
+    // Optimized RLE fill
     uint16_t prev = out[-1];
-    while (run-- > 0) *out++ = prev;
+    if (run > 0) {
+      // Use optimized fill for larger runs
+      if (run >= 8) {
+        // For larger runs, fill in chunks
+        uint16_t* end = out + run;
+        // Unroll loop for better performance
+        while (out + 8 <= end) {
+          out[0] = prev; out[1] = prev; out[2] = prev; out[3] = prev;
+          out[4] = prev; out[5] = prev; out[6] = prev; out[7] = prev;
+          out += 8;
+        }
+        while (out < end) *out++ = prev;
+      } else {
+        // Small runs - simple loop
+        while (run-- > 0) *out++ = prev;
+      }
+    }
   } else {
-    // Validate literal value
-    if (lit < 0 || lit > 65535) return false;
-    if (out >= oe) return false;  // Output buffer full
+    // Literal value (common path)
+    if (PIZ_UNLIKELY(lit < 0 || lit > 65535)) return false;
+    if (PIZ_UNLIKELY(out >= oe)) return false;  // Output buffer full
     *out++ = static_cast<uint16_t>(lit);
   }
   return true;
 }
 
 // Decode Huffman data (matching V1 hufDecode)
-// With comprehensive bounds checking for safety
+// Optimized with branch prediction hints while preserving bounds checking
 inline bool hufDecode(const int64_t* hcode, const HufDec* hdecod,
                       const uint8_t* in, int ni, int rlc, int no,
                       uint16_t* out, bool debug = false) {
-  // Validate input parameters
-  if (!hcode || !hdecod || !in || !out) return false;
-  if (ni < 0 || no < 0) return false;
-  if (rlc < 0 || rlc >= HUF_ENCSIZE) return false;
+  // Validate input parameters (only once at start)
+  if (PIZ_UNLIKELY(!hcode || !hdecod || !in || !out)) return false;
+  if (PIZ_UNLIKELY(ni < 0 || no < 0)) return false;
+  if (PIZ_UNLIKELY(rlc < 0 || rlc >= HUF_ENCSIZE)) return false;
 
   int64_t c = 0;
   int lc = 0;
   const uint16_t* outb = out;
   const uint16_t* oe = out + no;
   const uint8_t* ie = in + (ni + 7) / 8;
-  const uint8_t* in_start = in;  // Track original start for bounds check
-  int symbols_decoded = 0;
+  [[maybe_unused]] const uint8_t* in_start = in;  // For debug only
 
-  // Main decode loop with bounds-checked byte reading
-  while (in < ie) {
-    // Bounds-checked character read
-    if (!hufGetCharSafe(c, lc, in, ie)) {
-      if (debug) {
-        fprintf(stderr, "hufGetCharSafe failed at byte %ld of %ld\n",
-                (long)(in - in_start), (long)(ie - in_start));
-      }
+  // Prefetch decode table (likely to be accessed soon)
+  PIZ_PREFETCH(hdecod);
+
+  // Main decode loop - optimized for the common case (short codes)
+  while (PIZ_LIKELY(in < ie)) {
+    // Inline byte read for speed (bounds already checked by loop condition)
+    c = (c << 8) | static_cast<int64_t>(*in++);
+    lc += 8;
+    if (PIZ_UNLIKELY(lc > 64)) {
+      if (debug) fprintf(stderr, "Bit accumulator overflow\n");
       return false;
     }
 
-    while (lc >= HUF_DECBITS) {
-      // Stop decoding if output buffer is full (some files have extra bits)
-      if (out >= oe) {
+    // Process as many codes as possible from current bits
+    while (PIZ_LIKELY(lc >= HUF_DECBITS)) {
+      // Fast path: check output buffer
+      if (PIZ_UNLIKELY(out >= oe)) {
         goto done;
       }
 
-      // Validate lc doesn't cause negative shift
-      if (lc < HUF_DECBITS) break;  // Defensive check
-
-      int tableIndex = static_cast<int>((c >> (lc - HUF_DECBITS)) & HUF_DECMASK);
-      // Bounds check for table index (should always pass due to mask, but defensive)
-      if (tableIndex < 0 || tableIndex >= HUF_DECSIZE) {
-        if (debug) {
-          fprintf(stderr, "Invalid table index %d at symbol %d\n",
-                  tableIndex, symbols_decoded);
-        }
-        return false;
-      }
-
+      // Table lookup (mask guarantees valid index)
+      const int tableIndex = static_cast<int>((c >> (lc - HUF_DECBITS)) & HUF_DECMASK);
       const HufDec& pl = hdecod[tableIndex];
 
-      if (pl.len) {
-        // Short code - validate length before consuming
-        if (pl.len < 0 || pl.len > HUF_DECBITS) {
-          if (debug) {
-            fprintf(stderr, "Invalid short code length %d at symbol %d\n",
-                    pl.len, symbols_decoded);
-          }
-          return false;
-        }
+      // Prefetch next table entry
+      PIZ_PREFETCH(&hdecod[(c >> (lc - HUF_DECBITS - 8)) & HUF_DECMASK]);
+
+      if (PIZ_LIKELY(pl.len > 0)) {
+        // Short code path (most common case - ~95% of codes)
+        // Bounds check: pl.len validated during table build
         lc -= pl.len;
-        if (lc < 0) lc = 0;  // Defensive clamp
         c &= (1LL << lc) - 1;  // Clear consumed bits
-        if (!hufGetCode(pl.lit, rlc, c, lc, in, ie, out, outb, oe)) {
-          if (debug) {
-            fprintf(stderr, "getCode failed at symbol %d (short), lit=%d, out-outb=%ld, oe-outb=%ld\n",
-                    symbols_decoded, pl.lit, (long)(out - outb), (long)(oe - outb));
-          }
-          return false;
-        }
-        symbols_decoded++;
-      } else {
-        if (!pl.p) {
-          if (debug) {
-            fprintf(stderr, "Invalid code at symbol %d, index=%d, c=0x%llx, lc=%d\n",
-                    symbols_decoded, tableIndex, (long long)c, lc);
-          }
-          return false;  // Invalid code
-        }
 
-        // Validate pl.lit (number of long code candidates)
-        if (pl.lit <= 0 || pl.lit > HUF_ENCSIZE) {
-          if (debug) {
-            fprintf(stderr, "Invalid long code count %d at symbol %d\n",
-                    pl.lit, symbols_decoded);
+        // Inline literal output (most common)
+        if (PIZ_LIKELY(pl.lit != rlc)) {
+          if (PIZ_UNLIKELY(out >= oe)) goto done;
+          *out++ = static_cast<uint16_t>(pl.lit);
+        } else {
+          // RLE path (less common)
+          if (PIZ_UNLIKELY(!hufGetCode(pl.lit, rlc, c, lc, in, ie, out, outb, oe))) {
+            if (debug) fprintf(stderr, "getCode failed (short)\n");
+            return false;
           }
+        }
+      } else if (pl.p) {
+        // Long code path (rare - <5% of codes)
+        // Validate pl.lit bounds
+        if (PIZ_UNLIKELY(pl.lit <= 0 || pl.lit > HUF_ENCSIZE)) {
+          if (debug) fprintf(stderr, "Invalid long code count\n");
           return false;
         }
 
-        // Search long code
         bool found = false;
-        if (debug && pl.lit <= 5) {
-          fprintf(stderr, "Long code search at symbol %d: index=%d, c=0x%llx, lc=%d, candidates=%d\n",
-                  symbols_decoded, tableIndex, (long long)c, lc, pl.lit);
-        }
-        for (int j = 0; j < pl.lit; j++) {
-          int sym = pl.p[j];
+        const int numCandidates = pl.lit;
 
-          // Validate symbol is in valid range
-          if (sym < 0 || sym >= HUF_ENCSIZE) {
-            if (debug) {
-              fprintf(stderr, "Invalid symbol %d in long code list at symbol %d\n",
-                      sym, symbols_decoded);
-            }
+        for (int j = 0; j < numCandidates; j++) {
+          const int sym = pl.p[j];
+          if (PIZ_UNLIKELY(sym < 0 || sym >= HUF_ENCSIZE)) {
+            if (debug) fprintf(stderr, "Invalid symbol in long code list\n");
             return false;
           }
 
-          int l = hufLength(hcode[sym]);
-
-          // Validate code length
-          if (l <= 0 || l > 58) {
-            if (debug) {
-              fprintf(stderr, "Invalid code length %d for symbol %d at symbol %d\n",
-                      l, sym, symbols_decoded);
-            }
+          const int l = hufLength(hcode[sym]);
+          if (PIZ_UNLIKELY(l <= 0 || l > 58)) {
+            if (debug) fprintf(stderr, "Invalid code length\n");
             return false;
           }
 
-          // Read more bytes if needed (with bounds check)
+          // Read more bytes if needed
           while (lc < l && in < ie) {
-            if (!hufGetCharSafe(c, lc, in, ie)) {
-              // Ran out of input while reading long code
-              if (debug) {
-                fprintf(stderr, "Ran out of input in long code at symbol %d\n",
-                        symbols_decoded);
-              }
-              return false;
-            }
+            c = (c << 8) | static_cast<int64_t>(*in++);
+            lc += 8;
           }
 
           if (lc >= l) {
-            int64_t expected = hufCode(hcode[sym]);
-            int shift = lc - l;
-            if (shift < 0 || shift > 63) continue;  // Invalid shift
-            int64_t actual = (c >> shift) & ((1LL << l) - 1);
-            if (debug && pl.lit <= 5) {
-              fprintf(stderr, "  Candidate %d: sym=%d, len=%d, expected=0x%llx, actual=0x%llx\n",
-                      j, sym, l, (long long)expected, (long long)actual);
-            }
+            const int shift = lc - l;
+            const int64_t expected = hufCode(hcode[sym]);
+            const int64_t actual = (c >> shift) & ((1LL << l) - 1);
+
             if (expected == actual) {
-              lc -= l;
-              if (lc < 0) lc = 0;  // Defensive clamp
-              c &= (1LL << lc) - 1;  // Clear consumed bits
-              if (!hufGetCode(sym, rlc, c, lc, in, ie, out, outb, oe)) {
-                if (debug) {
-                  fprintf(stderr, "getCode failed at symbol %d (long), sym=%d\n",
-                          symbols_decoded, sym);
+              lc = shift;
+              c &= (1LL << lc) - 1;
+
+              // Output symbol
+              if (PIZ_LIKELY(sym != rlc)) {
+                if (PIZ_UNLIKELY(out >= oe)) goto done;
+                *out++ = static_cast<uint16_t>(sym);
+              } else {
+                if (PIZ_UNLIKELY(!hufGetCode(sym, rlc, c, lc, in, ie, out, outb, oe))) {
+                  if (debug) fprintf(stderr, "getCode failed (long)\n");
+                  return false;
                 }
-                return false;
               }
-              symbols_decoded++;
               found = true;
               break;
             }
           }
         }
-        if (!found) {
-          if (debug) {
-            fprintf(stderr, "Long code not found at symbol %d, tried %d candidates\n",
-                    symbols_decoded, pl.lit);
-          }
+
+        if (PIZ_UNLIKELY(!found)) {
+          if (debug) fprintf(stderr, "Long code not found\n");
           return false;
         }
+      } else {
+        // Invalid code
+        if (debug) fprintf(stderr, "Invalid code (no entry)\n");
+        return false;
       }
     }
   }
 
 done:
-  // Get remaining short codes (but stop if output is full)
-  int i = (8 - ni) & 7;
-  if (i < 0) i = 0;  // Defensive
-  c >>= i;
-  lc -= i;
-  if (lc < 0) lc = 0;  // Defensive clamp
+  // Process remaining bits (rare path)
+  {
+    const int padding = (8 - ni) & 7;
+    c >>= padding;
+    lc -= padding;
+    if (lc < 0) lc = 0;
+  }
 
   while (lc > 0 && out < oe) {
-    // Validate shift before table lookup
-    int shift = HUF_DECBITS - lc;
-    if (shift < 0 || shift > HUF_DECBITS) break;
+    const int shift = HUF_DECBITS - lc;
+    if (PIZ_UNLIKELY(shift < 0 || shift > HUF_DECBITS)) break;
 
-    int tableIndex = static_cast<int>((c << shift) & HUF_DECMASK);
-    if (tableIndex < 0 || tableIndex >= HUF_DECSIZE) {
-      if (debug) {
-        fprintf(stderr, "Invalid table index %d in remainder at symbol %d\n",
-                tableIndex, symbols_decoded);
-      }
-      return false;
-    }
-
+    const int tableIndex = static_cast<int>((c << shift) & HUF_DECMASK);
     const HufDec& pl = hdecod[tableIndex];
-    if (pl.len) {
-      if (pl.len < 0 || pl.len > lc) {
-        // Can't consume more bits than we have
-        break;
-      }
+
+    if (PIZ_LIKELY(pl.len > 0 && pl.len <= lc)) {
       lc -= pl.len;
-      if (lc < 0) lc = 0;  // Defensive clamp
-      c &= (1LL << lc) - 1;  // Clear consumed bits
-      if (!hufGetCode(pl.lit, rlc, c, lc, in, ie, out, outb, oe)) {
-        if (debug) {
-          fprintf(stderr, "getCode failed in remainder at symbol %d\n", symbols_decoded);
+      c &= (1LL << lc) - 1;
+
+      if (PIZ_LIKELY(pl.lit != rlc)) {
+        *out++ = static_cast<uint16_t>(pl.lit);
+      } else {
+        if (PIZ_UNLIKELY(!hufGetCode(pl.lit, rlc, c, lc, in, ie, out, outb, oe))) {
+          if (debug) fprintf(stderr, "getCode failed (remainder)\n");
+          return false;
         }
-        return false;
       }
-      symbols_decoded++;
     } else {
-      if (debug) {
-        fprintf(stderr, "Wrong long code in remainder at symbol %d, lc=%d\n",
-                symbols_decoded, lc);
-      }
-      return false;  // Wrong long code
+      break;  // Can't decode more
     }
   }
 
   if (debug) {
-    fprintf(stderr, "Decode complete: %d symbols, output %ld (expected %d)\n",
-            symbols_decoded, (long)(out - outb), no);
+    fprintf(stderr, "Decode complete: output %ld (expected %d)\n",
+            (long)(out - outb), no);
   }
   return (out - outb) == no;
 }

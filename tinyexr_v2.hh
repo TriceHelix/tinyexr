@@ -939,6 +939,80 @@ inline bool DecompressZlib(const uint8_t* src, size_t src_len,
 #endif
 }
 
+// ============================================================================
+// Memory Pool for Temporary Buffers
+// ============================================================================
+
+// Thread-local scratch buffer pool to avoid repeated allocations
+// during decompression operations
+class ScratchPool {
+public:
+  static constexpr size_t SMALL_SIZE = 64 * 1024;     // 64KB
+  static constexpr size_t MEDIUM_SIZE = 256 * 1024;   // 256KB
+  static constexpr size_t LARGE_SIZE = 1024 * 1024;   // 1MB
+
+  ScratchPool() {
+    small_.resize(SMALL_SIZE);
+    medium_.resize(MEDIUM_SIZE);
+    large_.resize(LARGE_SIZE);
+  }
+
+  // Get pre-allocated small buffer (64KB)
+  uint8_t* get_small() { return small_.data(); }
+  size_t small_size() const { return SMALL_SIZE; }
+
+  // Get pre-allocated medium buffer (256KB)
+  uint8_t* get_medium() { return medium_.data(); }
+  size_t medium_size() const { return MEDIUM_SIZE; }
+
+  // Get pre-allocated large buffer (1MB)
+  uint8_t* get_large() { return large_.data(); }
+  size_t large_size() const { return LARGE_SIZE; }
+
+  // Get dynamic buffer, resizing if needed
+  uint8_t* get_dynamic(size_t needed) {
+    if (dynamic_.size() < needed) {
+      dynamic_.resize(needed);
+    }
+    return dynamic_.data();
+  }
+  size_t dynamic_size() const { return dynamic_.size(); }
+
+  // Get best-fit buffer for given size
+  // Returns pointer to appropriate pre-allocated buffer if size fits,
+  // otherwise allocates dynamic buffer
+  uint8_t* get_buffer(size_t needed) {
+    if (needed <= SMALL_SIZE) {
+      return get_small();
+    } else if (needed <= MEDIUM_SIZE) {
+      return get_medium();
+    } else if (needed <= LARGE_SIZE) {
+      return get_large();
+    } else {
+      return get_dynamic(needed);
+    }
+  }
+
+  // Clear dynamic buffer to release memory
+  void clear_dynamic() {
+    dynamic_.clear();
+    dynamic_.shrink_to_fit();
+  }
+
+private:
+  std::vector<uint8_t> small_;
+  std::vector<uint8_t> medium_;
+  std::vector<uint8_t> large_;
+  std::vector<uint8_t> dynamic_;
+};
+
+// Thread-local scratch pool instance
+// Each thread gets its own pool to avoid contention
+inline ScratchPool& get_scratch_pool() {
+  static thread_local ScratchPool pool;
+  return pool;
+}
+
 }  // namespace v2
 }  // namespace tinyexr
 

@@ -761,3 +761,101 @@ TEST_CASE("v2: DeinterleaveRGBA", "[SIMD][Interleave]") {
     }
   }
 }
+
+// ============================================================================
+// PIZ Decompression Tests
+// ============================================================================
+
+TEST_CASE("v2: Load PIZ compressed EXR - issue-160-piz-decode.exr", "[PIZ][Decompress]") {
+  std::vector<uint8_t> file_data = ReadFile("regression/issue-160-piz-decode.exr");
+
+  if (file_data.empty()) {
+    WARN("Test file regression/issue-160-piz-decode.exr not found, skipping");
+    return;
+  }
+
+  auto result = tinyexr::v2::LoadFromMemory(file_data.data(), file_data.size());
+
+  SECTION("PIZ file loads successfully") {
+    // Print any errors for debugging
+    if (!result.success) {
+      INFO("Error: " + result.error_string());
+    }
+    if (!result.warnings.empty()) {
+      INFO("Warnings: " + result.warnings_string());
+    }
+
+    REQUIRE(result.success == true);
+    REQUIRE(result.value.width > 0);
+    REQUIRE(result.value.height > 0);
+    REQUIRE(result.value.header.compression == 4);  // PIZ = 4
+  }
+
+  SECTION("Pixel data is valid") {
+    if (!result.success) return;
+
+    // Check that we have actual pixel data
+    size_t expected_size = static_cast<size_t>(result.value.width) *
+                           static_cast<size_t>(result.value.height) * 4;
+    REQUIRE(result.value.rgba.size() == expected_size);
+
+    // Check some pixels are non-zero (image has content)
+    bool has_nonzero = false;
+    for (size_t i = 0; i < result.value.rgba.size() && !has_nonzero; i++) {
+      if (result.value.rgba[i] != 0.0f) {
+        has_nonzero = true;
+      }
+    }
+    REQUIRE(has_nonzero == true);
+  }
+}
+
+TEST_CASE("v2: Load PIZ compressed EXR - piz-bug-issue-100.exr", "[PIZ][Decompress]") {
+  std::vector<uint8_t> file_data = ReadFile("regression/piz-bug-issue-100.exr");
+
+  if (file_data.empty()) {
+    WARN("Test file regression/piz-bug-issue-100.exr not found, skipping");
+    return;
+  }
+
+  auto result = tinyexr::v2::LoadFromMemory(file_data.data(), file_data.size());
+
+  SECTION("PIZ file loads successfully (issue 100 regression)") {
+    if (!result.success) {
+      INFO("Error: " + result.error_string());
+    }
+    if (!result.warnings.empty()) {
+      INFO("Warnings: " + result.warnings_string());
+    }
+
+    REQUIRE(result.success == true);
+    REQUIRE(result.value.width > 0);
+    REQUIRE(result.value.height > 0);
+  }
+}
+
+TEST_CASE("v2: Load PIZ edge case - issue-194 (all zeros)", "[PIZ][Decompress]") {
+  std::vector<uint8_t> file_data = ReadFile("regression/000-issue194.exr");
+
+  if (file_data.empty()) {
+    WARN("Test file regression/000-issue194.exr not found, skipping");
+    return;
+  }
+
+  auto result = tinyexr::v2::LoadFromMemory(file_data.data(), file_data.size());
+
+  SECTION("PIZ file with special minNonZero/maxNonZero handles correctly") {
+    if (!result.success) {
+      INFO("Error: " + result.error_string());
+    }
+
+    // This file may use a special case where all pixels are zero
+    // The decompressor should handle this gracefully
+    if (!result.warnings.empty()) {
+      INFO("Warnings: " + result.warnings_string());
+    }
+
+    // Either succeeds or gives a meaningful error/warning
+    // The key is that it doesn't crash
+  }
+}

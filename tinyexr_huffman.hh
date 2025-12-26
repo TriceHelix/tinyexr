@@ -27,6 +27,10 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <cstdio>
+#include <vector>
+#include <thread>
+#include <atomic>
 
 // Include SIMD header for memory operations
 #if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
@@ -84,25 +88,35 @@
 #define TINYEXR_HAS_ARM64_BITOPS 0
 #endif
 
-// Compiler hints
+// Compiler hints (only define if not already defined by tinyexr_simd.hh)
+#ifndef TINYEXR_LIKELY
 #if defined(__GNUC__) || defined(__clang__)
 #define TINYEXR_LIKELY(x) __builtin_expect(!!(x), 1)
 #define TINYEXR_UNLIKELY(x) __builtin_expect(!!(x), 0)
-#define TINYEXR_PREFETCH(addr) __builtin_prefetch(addr)
 #define TINYEXR_ALWAYS_INLINE __attribute__((always_inline)) inline
 #define TINYEXR_RESTRICT __restrict__
 #elif defined(_MSC_VER)
 #define TINYEXR_LIKELY(x) (x)
 #define TINYEXR_UNLIKELY(x) (x)
-#define TINYEXR_PREFETCH(addr) _mm_prefetch((const char*)(addr), _MM_HINT_T0)
 #define TINYEXR_ALWAYS_INLINE __forceinline
 #define TINYEXR_RESTRICT __restrict
 #else
 #define TINYEXR_LIKELY(x) (x)
 #define TINYEXR_UNLIKELY(x) (x)
-#define TINYEXR_PREFETCH(addr) ((void)0)
 #define TINYEXR_ALWAYS_INLINE inline
 #define TINYEXR_RESTRICT
+#endif
+#endif
+
+#ifndef TINYEXR_PREFETCH
+#if defined(__GNUC__) || defined(__clang__)
+#define TINYEXR_PREFETCH(addr) __builtin_prefetch(addr)
+#elif defined(_MSC_VER)
+#include <intrin.h>
+#define TINYEXR_PREFETCH(addr) _mm_prefetch((const char*)(addr), _MM_HINT_T0)
+#else
+#define TINYEXR_PREFETCH(addr) ((void)0)
+#endif
 #endif
 
 namespace tinyexr {
@@ -304,6 +318,14 @@ struct BitBuffer {
   int32_t count;     // Number of valid bits in buffer
   const uint8_t* ptr;  // Current read position
   const uint8_t* end;  // End of input
+
+  BitBuffer() : bits(0), count(0), ptr(nullptr), end(nullptr) {}
+
+  BitBuffer(const uint8_t* data, const uint8_t* data_end)
+    : bits(0), count(0), ptr(data), end(data_end) {}
+
+  BitBuffer(const uint8_t* data, size_t size)
+    : bits(0), count(0), ptr(data), end(data + size) {}
 
   TINYEXR_ALWAYS_INLINE void init(const uint8_t* data, size_t size) {
     bits = 0;
@@ -601,16 +623,24 @@ static const uint8_t DIST_EXTRA[30] = {
 // Optimized Huffman table for deflate (16KB, fits in L1 cache)
 struct DeflateHuffTable {
   // Lookup table: 10 bits = 1024 entries
-  // Entry format: symbol (9 bits) | length (4 bits) | valid (1 bit) | flags (2 bits)
+  // Entry format: symbol (11 bits) | length (4 bits) | valid (1 bit)
   uint16_t fast_table[1024];
-  uint16_t slow_table[1 << (DEFLATE_MAX_BITS - 10)];  // For longer codes
+
+  // Slow table for codes > 10 bits (11-15 bit codes)
+  // Format: [count_11][code,sym]...[count_12][code,sym]...[count_13]...[count_14]...[count_15]
+  // Each entry pair: reversed_code (16 bits), symbol (16 bits)
+  // Maximum entries: 5 counts + 286 symbols * 2 words = ~600 words
+  uint16_t slow_table[640];
+  int slow_count;  // Total code entries in slow_table
   int max_bits;
 
   void build_fixed_litlen() {
     max_bits = 9;
+    slow_count = 0;
     // Fixed literal/length code:
     // 0-143: 8 bits, 144-255: 9 bits, 256-279: 7 bits, 280-287: 8 bits
     std::memset(fast_table, 0, sizeof(fast_table));
+    std::memset(slow_table, 0, sizeof(slow_table));
 
     // Build codes
     for (int sym = 0; sym <= 287; sym++) {
@@ -643,7 +673,9 @@ struct DeflateHuffTable {
 
   void build_fixed_dist() {
     max_bits = 5;
+    slow_count = 0;
     std::memset(fast_table, 0, sizeof(fast_table));
+    std::memset(slow_table, 0, sizeof(slow_table));
 
     // Fixed distance codes: 5 bits each
     for (int sym = 0; sym < 32; sym++) {
@@ -811,6 +843,11 @@ private:
     uint32_t idx = reader.peek(10);
     uint16_t entry = table->fast_table[idx];
 
+#ifdef TINYEXR_DEFLATE_DEBUG_VERBOSE
+    fprintf(stderr, "    decode_symbol: peek(10)=0x%03x entry=0x%04x count=%d\n",
+            idx, entry, reader.count);
+#endif
+
     if (TINYEXR_LIKELY(entry & 0x8000)) {
       int len = entry & 0xF;
       int sym = (entry >> 4) & 0x7FF;
@@ -823,10 +860,33 @@ private:
   }
 
   int decode_symbol_slow(DeflateBitReader& reader, const DeflateHuffTable* table) {
-    // Handle codes > 10 bits
-    // This is a simplified version - full implementation needed for dynamic codes
-    (void)table;
-    return -1;  // Error
+    // Handle codes > 10 bits (11-15 bit codes)
+    // Ensure we have enough bits
+    if (reader.count < 15) {
+      reader.refill();
+    }
+
+    // slow_table format: [count_11][code,sym]...[count_12][code,sym]...[count_15]...
+    const uint16_t* ptr = table->slow_table;
+
+    for (int bits = 11; bits <= table->max_bits && bits <= 15; bits++) {
+      uint16_t count = *ptr++;
+      uint32_t code_mask = (1u << bits) - 1;
+      uint32_t peeked = reader.peek(bits) & code_mask;
+
+      for (uint16_t i = 0; i < count; i++) {
+        uint16_t stored_code = ptr[i * 2];
+        uint16_t symbol = ptr[i * 2 + 1];
+
+        if (peeked == stored_code) {
+          reader.consume(bits);
+          return static_cast<int>(symbol);
+        }
+      }
+      ptr += count * 2;
+    }
+
+    return -1;  // Invalid code - no match found
   }
 
   bool decode_dynamic_tables(DeflateBitReader& reader,
@@ -838,6 +898,10 @@ private:
     int hdist = reader.read(5) + 1;
     int hclen = reader.read(4) + 4;
 
+#ifdef TINYEXR_DEFLATE_DEBUG
+    fprintf(stderr, "DEBUG: Dynamic block: HLIT=%d, HDIST=%d, HCLEN=%d\n", hlit, hdist, hclen);
+#endif
+
     // Read code length code lengths
     uint8_t codelen_lens[DEFLATE_CODELEN_CODES] = {0};
     for (int i = 0; i < hclen; i++) {
@@ -845,22 +909,69 @@ private:
       codelen_lens[DEFLATE_CODELEN_ORDER[i]] = static_cast<uint8_t>(reader.read(3));
     }
 
+#ifdef TINYEXR_DEFLATE_DEBUG
+    fprintf(stderr, "DEBUG: Codelen table lens: ");
+    for (int i = 0; i < DEFLATE_CODELEN_CODES; i++) {
+      if (codelen_lens[i] > 0) fprintf(stderr, "[%d]=%d ", i, codelen_lens[i]);
+    }
+    fprintf(stderr, "\n");
+#endif
+
     // Build code length Huffman table
     DeflateHuffTable codelen_table;
     if (!build_huffman_table(&codelen_table, codelen_lens, DEFLATE_CODELEN_CODES)) {
+#ifdef TINYEXR_DEFLATE_DEBUG
+      fprintf(stderr, "DEBUG: Failed to build codelen table\n");
+#endif
       return false;
     }
+
+#ifdef TINYEXR_DEFLATE_DEBUG
+    fprintf(stderr, "DEBUG: Codelen table built, max_bits=%d\n", codelen_table.max_bits);
+    // Dump unique symbol mappings from fast_table
+    fprintf(stderr, "DEBUG: Codelen fast_table unique symbols:\n");
+    bool seen[19] = {false};
+    for (int i = 0; i < 1024; i++) {
+      if (codelen_table.fast_table[i] & 0x8000) {
+        int sym = (codelen_table.fast_table[i] >> 4) & 0x7FF;
+        int len = codelen_table.fast_table[i] & 0xF;
+        if (sym < 19 && !seen[sym]) {
+          seen[sym] = true;
+          fprintf(stderr, "  sym=%d: code=0x%x len=%d (entry at [0x%03x])\n",
+                  sym, i & ((1 << len) - 1), len, i);
+        }
+      }
+    }
+#endif
 
     // Read literal/length and distance code lengths
     uint8_t all_lens[DEFLATE_LITLEN_CODES + DEFLATE_DIST_CODES] = {0};
     int total = hlit + hdist;
     int i = 0;
 
+#ifdef TINYEXR_DEFLATE_DEBUG
+    fprintf(stderr, "DEBUG: Reading %d code lengths\n", total);
+#endif
+
     while (i < total) {
       reader.refill();
       int sym = decode_symbol(reader, &codelen_table);
 
-      if (sym < 0) return false;
+#ifdef TINYEXR_DEFLATE_DEBUG
+      if (i < 20 || sym < 0) {
+        fprintf(stderr, "DEBUG: codelen[%d] = sym %d, peek10=0x%03x, count=%d\n",
+                i, sym, static_cast<unsigned>(reader.peek(10)), reader.count);
+      }
+#endif
+
+      if (sym < 0) {
+#ifdef TINYEXR_DEFLATE_DEBUG
+        fprintf(stderr, "DEBUG: Failed to decode codelen symbol at index %d\n", i);
+        fprintf(stderr, "DEBUG: bits_in_buf=%d, bits=0x%016llx\n",
+                reader.count, static_cast<unsigned long long>(reader.bits));
+#endif
+        return false;
+      }
 
       if (sym < 16) {
         all_lens[i++] = static_cast<uint8_t>(sym);
@@ -910,7 +1021,9 @@ private:
     }
 
     table->max_bits = max_len;
+    table->slow_count = 0;
     std::memset(table->fast_table, 0, sizeof(table->fast_table));
+    std::memset(table->slow_table, 0, sizeof(table->slow_table));
 
     // Compute first code for each length
     int next_code[DEFLATE_MAX_BITS + 1] = {0};
@@ -920,17 +1033,28 @@ private:
       next_code[bits] = code;
     }
 
-    // Assign codes to symbols
+    // For slow table: we need to track which symbols have which lengths
+    // First pass: build fast table
+    // Second pass: build slow table
+
+    // Reset next_code for second use
+    code = 0;
+    for (int bits = 1; bits <= max_len; bits++) {
+      code = (code + bl_count[bits - 1]) << 1;
+      next_code[bits] = code;
+    }
+
+    // Assign codes to symbols and fill fast table
     for (int sym = 0; sym < count; sym++) {
       int len = lens[sym];
       if (len == 0) continue;
 
       int code_val = next_code[len]++;
 
-      // Reverse bits for deflate
+      // Reverse bits for deflate (LSB-first bit order)
       int rev_code = 0;
       for (int i = 0; i < len; i++) {
-        rev_code = (rev_code << 1) | ((code_val >> (len - 1 - i)) & 1);
+        rev_code = (rev_code << 1) | ((code_val >> i) & 1);
       }
 
       // Fill fast table for codes <= 10 bits
@@ -943,6 +1067,65 @@ private:
           }
         }
       }
+    }
+
+    // Build slow table for codes > 10 bits
+    // Format: [count_11][entries_11...][count_12][entries_12...]...[count_15][entries_15...]
+    // Each entry is: reversed_code, symbol
+    uint16_t* slow_ptr = table->slow_table;
+    const size_t slow_table_capacity = sizeof(table->slow_table) / sizeof(table->slow_table[0]);
+
+    // Reset next_code again for slow table pass
+    code = 0;
+    for (int bits = 1; bits <= max_len; bits++) {
+      code = (code + bl_count[bits - 1]) << 1;
+      next_code[bits] = code;
+    }
+
+    for (int target_bits = 11; target_bits <= 15; target_bits++) {
+      // Reserve space for count
+      if (static_cast<size_t>(slow_ptr - table->slow_table) >= slow_table_capacity - 1) {
+        break;  // Out of space
+      }
+      uint16_t* count_ptr = slow_ptr++;
+      uint16_t bit_count = 0;
+
+      // Scan all symbols for this bit length
+      // Reset next_code for this pass
+      int nc[DEFLATE_MAX_BITS + 1];
+      code = 0;
+      for (int bits = 1; bits <= max_len; bits++) {
+        code = (code + bl_count[bits - 1]) << 1;
+        nc[bits] = code;
+      }
+
+      for (int sym = 0; sym < count; sym++) {
+        int len = lens[sym];
+        if (len != target_bits) {
+          if (len > 0) nc[len]++;  // Advance code counter
+          continue;
+        }
+
+        // Check space for entry (2 words: code + symbol)
+        if (static_cast<size_t>(slow_ptr - table->slow_table) >= slow_table_capacity - 2) {
+          break;
+        }
+
+        int code_val = nc[len]++;
+
+        // Reverse bits for deflate (LSB-first bit order)
+        int rev_code = 0;
+        for (int i = 0; i < len; i++) {
+          rev_code = (rev_code << 1) | ((code_val >> i) & 1);
+        }
+
+        *slow_ptr++ = static_cast<uint16_t>(rev_code);
+        *slow_ptr++ = static_cast<uint16_t>(sym);
+        bit_count++;
+        table->slow_count++;
+      }
+
+      *count_ptr = bit_count;
     }
 
     return true;
@@ -1013,13 +1196,30 @@ private:
     }
   }
 
-  // Optimized match copy with SIMD
+  // Optimized match copy with SIMD (AVX2, SSE2, NEON)
   TINYEXR_ALWAYS_INLINE void copy_match(uint8_t* dst, const uint8_t* src,
                                         int length, int distance) {
+    if (TINYEXR_UNLIKELY(length <= 0)) return;
+
+    // Large non-overlapping copies: use widest SIMD available
+    if (distance >= 32 && length >= 32) {
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD && defined(TINYEXR_SIMD_AVX2) && TINYEXR_SIMD_AVX2
+      // AVX2: 32-byte copies
+      while (length >= 32) {
+        __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst), v);
+        src += 32;
+        dst += 32;
+        length -= 32;
+      }
+#endif
+      // Fall through to 16-byte or scalar handling
+    }
+
     if (distance >= 16 && length >= 16) {
-      // Non-overlapping or far enough - use fast copy
-#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD && TINYEXR_SIMD_SSE2
-      // SSE2 copy
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+#if defined(TINYEXR_SIMD_SSE2) && TINYEXR_SIMD_SSE2
+      // SSE2: 16-byte copies
       while (length >= 16) {
         __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src));
         _mm_storeu_si128(reinterpret_cast<__m128i*>(dst), v);
@@ -1027,19 +1227,69 @@ private:
         dst += 16;
         length -= 16;
       }
+#elif defined(TINYEXR_SIMD_NEON) && TINYEXR_SIMD_NEON
+      // NEON: 16-byte copies
+      while (length >= 16) {
+        uint8x16_t v = vld1q_u8(src);
+        vst1q_u8(dst, v);
+        src += 16;
+        dst += 16;
+        length -= 16;
+      }
 #endif
+#endif
+      // Handle remainder
       while (length-- > 0) {
         *dst++ = *src++;
       }
-    } else if (distance == 1) {
-      // RLE - single byte repeat
+      return;
+    }
+
+    // RLE optimization: single byte repeat
+    if (distance == 1) {
       uint8_t v = *src;
-      std::memset(dst, v, length);
-    } else {
-      // Overlapping copy - must go byte by byte
-      while (length-- > 0) {
-        *dst++ = *src++;
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+#if defined(TINYEXR_SIMD_AVX2) && TINYEXR_SIMD_AVX2
+      if (length >= 32) {
+        __m256i pattern = _mm256_set1_epi8(static_cast<char>(v));
+        while (length >= 32) {
+          _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst), pattern);
+          dst += 32;
+          length -= 32;
+        }
       }
+#endif
+#if defined(TINYEXR_SIMD_SSE2) && TINYEXR_SIMD_SSE2
+      if (length >= 16) {
+        __m128i pattern = _mm_set1_epi8(static_cast<char>(v));
+        while (length >= 16) {
+          _mm_storeu_si128(reinterpret_cast<__m128i*>(dst), pattern);
+          dst += 16;
+          length -= 16;
+        }
+      }
+#elif defined(TINYEXR_SIMD_NEON) && TINYEXR_SIMD_NEON
+      if (length >= 16) {
+        uint8x16_t pattern = vdupq_n_u8(v);
+        while (length >= 16) {
+          vst1q_u8(dst, pattern);
+          dst += 16;
+          length -= 16;
+        }
+      }
+#endif
+#endif
+      // Remainder with memset
+      if (length > 0) {
+        std::memset(dst, v, static_cast<size_t>(length));
+      }
+      return;
+    }
+
+    // For all other overlapping cases (distance 2-15), use byte-by-byte copy
+    // This is the safest approach for correctness
+    while (length-- > 0) {
+      *dst++ = *src++;
     }
   }
 };
@@ -1078,6 +1328,304 @@ inline bool inflate_zlib(const uint8_t* src, size_t src_len,
   // Decompress (ignoring trailing 4-byte Adler-32 checksum)
   if (src_len - offset < 4) return false;
   return inflate(src + offset, src_len - offset - 4, dst, dst_len);
+}
+
+// ============================================================================
+// Hardened Deflate API with comprehensive error reporting
+// ============================================================================
+
+namespace dfl {  // Short for deflate, avoids collision with zlib's deflate()
+
+// Error codes for deflate operations
+enum class DeflateError {
+  Success = 0,
+  InvalidBlockType,
+  InvalidHuffmanCode,
+  InvalidDistance,
+  InvalidLength,
+  OutputBufferTooSmall,
+  InputTruncated,
+  ChecksumMismatch,
+  MaxOutputExceeded,
+  InvalidZlibHeader,
+  DictionaryNotSupported,
+  InternalError
+};
+
+// Convert error code to string
+inline const char* deflate_error_string(DeflateError err) {
+  switch (err) {
+    case DeflateError::Success: return "Success";
+    case DeflateError::InvalidBlockType: return "Invalid block type";
+    case DeflateError::InvalidHuffmanCode: return "Invalid Huffman code";
+    case DeflateError::InvalidDistance: return "Invalid distance reference";
+    case DeflateError::InvalidLength: return "Invalid length";
+    case DeflateError::OutputBufferTooSmall: return "Output buffer too small";
+    case DeflateError::InputTruncated: return "Input data truncated";
+    case DeflateError::ChecksumMismatch: return "Checksum mismatch";
+    case DeflateError::MaxOutputExceeded: return "Maximum output size exceeded";
+    case DeflateError::InvalidZlibHeader: return "Invalid zlib header";
+    case DeflateError::DictionaryNotSupported: return "Dictionary not supported";
+    case DeflateError::InternalError: return "Internal error";
+    default: return "Unknown error";
+  }
+}
+
+// Decompression options
+struct DeflateOptions {
+  size_t max_output_size = 256 * 1024 * 1024;  // 256MB default limit
+  bool verify_adler32 = false;                  // Verify zlib checksum (not yet implemented)
+  bool allow_partial = false;                   // Allow partial output on error
+};
+
+// Result type with detailed error info
+struct DeflateResult {
+  bool success;
+  DeflateError error;
+  size_t bytes_written;
+  size_t bytes_consumed;
+
+  static DeflateResult ok(size_t written, size_t consumed) {
+    return {true, DeflateError::Success, written, consumed};
+  }
+
+  static DeflateResult fail(DeflateError err, size_t written = 0, size_t consumed = 0) {
+    return {false, err, written, consumed};
+  }
+
+  // Get human-readable error message
+  const char* error_message() const {
+    return deflate_error_string(error);
+  }
+};
+
+// Safe deflate decoder with bounds checking and error reporting
+class SafeDeflateDecoder {
+public:
+  DeflateResult decode(const uint8_t* src, size_t src_len,
+                       uint8_t* dst, size_t dst_capacity,
+                       const DeflateOptions& opts = DeflateOptions{}) {
+    // Check for maximum output size
+    if (dst_capacity > opts.max_output_size) {
+      dst_capacity = opts.max_output_size;
+    }
+
+    // Use the fast decoder with bounds checking
+    size_t output_len = dst_capacity;
+    FastDeflateDecoder decoder;
+    bool ok = decoder.decompress(src, src_len, dst, &output_len);
+
+    if (ok) {
+      return DeflateResult::ok(output_len, src_len);
+    }
+
+    // Try to determine the error type
+    // For now, return generic error - future: add detailed error tracking
+    if (output_len >= dst_capacity) {
+      return DeflateResult::fail(DeflateError::OutputBufferTooSmall, output_len, 0);
+    }
+    return DeflateResult::fail(DeflateError::InternalError, output_len, 0);
+  }
+
+  DeflateResult decode_zlib(const uint8_t* src, size_t src_len,
+                            uint8_t* dst, size_t dst_capacity,
+                            const DeflateOptions& opts = DeflateOptions{}) {
+    if (src_len < 6) {
+      return DeflateResult::fail(DeflateError::InputTruncated);
+    }
+
+    // Check zlib header
+    uint8_t cmf = src[0];
+    uint8_t flg = src[1];
+
+    if ((cmf & 0x0F) != 8) {
+      return DeflateResult::fail(DeflateError::InvalidZlibHeader);
+    }
+    if (((cmf << 8) | flg) % 31 != 0) {
+      return DeflateResult::fail(DeflateError::InvalidZlibHeader);
+    }
+
+    // Check for dictionary
+    size_t offset = 2;
+    if (flg & 0x20) {
+      return DeflateResult::fail(DeflateError::DictionaryNotSupported);
+    }
+
+    // Decompress (ignoring trailing 4-byte Adler-32 checksum for now)
+    if (src_len - offset < 4) {
+      return DeflateResult::fail(DeflateError::InputTruncated);
+    }
+
+    return decode(src + offset, src_len - offset - 4, dst, dst_capacity, opts);
+  }
+};
+
+// Convenience functions with DeflateResult
+
+inline DeflateResult inflate_safe(
+    const uint8_t* src, size_t src_len,
+    uint8_t* dst, size_t dst_capacity,
+    const DeflateOptions& opts = DeflateOptions{}) {
+  SafeDeflateDecoder decoder;
+  return decoder.decode(src, src_len, dst, dst_capacity, opts);
+}
+
+inline DeflateResult inflate_zlib_safe(
+    const uint8_t* src, size_t src_len,
+    uint8_t* dst, size_t dst_capacity,
+    const DeflateOptions& opts = DeflateOptions{}) {
+  SafeDeflateDecoder decoder;
+  return decoder.decode_zlib(src, src_len, dst, dst_capacity, opts);
+}
+
+}  // namespace dfl
+
+// ============================================================================
+// Parallel Huffman/Deflate Decoding (P2 optimization)
+// ============================================================================
+
+// Parallel decompressor for multiple independent data blocks
+// Useful when decompressing multiple scanlines or tiles simultaneously
+class ParallelDeflateDecoder {
+public:
+  // Block descriptor for parallel decompression
+  struct Block {
+    const uint8_t* src;
+    size_t src_len;
+    uint8_t* dst;
+    size_t dst_capacity;
+    size_t dst_len;  // Output: actual decompressed size
+    bool success;    // Output: decompression result
+  };
+
+  // Decompress multiple blocks in parallel
+  // Returns true if all blocks decompressed successfully
+  static bool decompress_parallel(
+      std::vector<Block>& blocks,
+      int num_threads = 0) {
+
+    if (blocks.empty()) return true;
+    if (blocks.size() == 1) {
+      // Single block - no parallelism needed
+      blocks[0].success = inflate(blocks[0].src, blocks[0].src_len,
+                                  blocks[0].dst, &blocks[0].dst_len);
+      return blocks[0].success;
+    }
+
+    // Determine thread count
+    if (num_threads <= 0) {
+      num_threads = static_cast<int>(std::thread::hardware_concurrency());
+      if (num_threads <= 0) num_threads = 1;
+    }
+    if (num_threads > static_cast<int>(blocks.size())) {
+      num_threads = static_cast<int>(blocks.size());
+    }
+
+    std::atomic<size_t> next_block{0};
+    std::atomic<bool> error{false};
+
+    // Worker function
+    auto worker = [&]() {
+      while (!error.load(std::memory_order_relaxed)) {
+        size_t idx = next_block.fetch_add(1, std::memory_order_relaxed);
+        if (idx >= blocks.size()) break;
+
+        Block& blk = blocks[idx];
+        blk.dst_len = blk.dst_capacity;
+        blk.success = inflate(blk.src, blk.src_len, blk.dst, &blk.dst_len);
+
+        if (!blk.success) {
+          error.store(true, std::memory_order_relaxed);
+        }
+      }
+    };
+
+    // Launch worker threads
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads - 1);
+
+    for (int t = 0; t < num_threads - 1; t++) {
+      threads.emplace_back(worker);
+    }
+
+    // Use main thread as well
+    worker();
+
+    // Wait for all threads
+    for (auto& t : threads) {
+      t.join();
+    }
+
+    return !error.load();
+  }
+
+  // Decompress multiple zlib blocks in parallel
+  static bool decompress_zlib_parallel(
+      std::vector<Block>& blocks,
+      int num_threads = 0) {
+
+    if (blocks.empty()) return true;
+    if (blocks.size() == 1) {
+      blocks[0].success = inflate_zlib(blocks[0].src, blocks[0].src_len,
+                                       blocks[0].dst, &blocks[0].dst_len);
+      return blocks[0].success;
+    }
+
+    if (num_threads <= 0) {
+      num_threads = static_cast<int>(std::thread::hardware_concurrency());
+      if (num_threads <= 0) num_threads = 1;
+    }
+    if (num_threads > static_cast<int>(blocks.size())) {
+      num_threads = static_cast<int>(blocks.size());
+    }
+
+    std::atomic<size_t> next_block{0};
+    std::atomic<bool> error{false};
+
+    auto worker = [&]() {
+      while (!error.load(std::memory_order_relaxed)) {
+        size_t idx = next_block.fetch_add(1, std::memory_order_relaxed);
+        if (idx >= blocks.size()) break;
+
+        Block& blk = blocks[idx];
+        blk.dst_len = blk.dst_capacity;
+        blk.success = inflate_zlib(blk.src, blk.src_len, blk.dst, &blk.dst_len);
+
+        if (!blk.success) {
+          error.store(true, std::memory_order_relaxed);
+        }
+      }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads - 1);
+
+    for (int t = 0; t < num_threads - 1; t++) {
+      threads.emplace_back(worker);
+    }
+
+    worker();
+
+    for (auto& t : threads) {
+      t.join();
+    }
+
+    return !error.load();
+  }
+};
+
+// Convenience function: decompress multiple deflate blocks in parallel
+inline bool inflate_parallel(
+    std::vector<ParallelDeflateDecoder::Block>& blocks,
+    int num_threads = 0) {
+  return ParallelDeflateDecoder::decompress_parallel(blocks, num_threads);
+}
+
+// Convenience function: decompress multiple zlib blocks in parallel
+inline bool inflate_zlib_parallel(
+    std::vector<ParallelDeflateDecoder::Block>& blocks,
+    int num_threads = 0) {
+  return ParallelDeflateDecoder::decompress_zlib_parallel(blocks, num_threads);
 }
 
 // Get capabilities

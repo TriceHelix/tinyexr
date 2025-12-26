@@ -1035,6 +1035,523 @@ inline void reverse_delta_predictor(uint8_t* data, size_t count) {
 }
 
 // ============================================================================
+// Optimized Delta Predictor (P1 optimization)
+// ============================================================================
+
+// Prefetch hint macro
+#ifndef TINYEXR_PREFETCH
+#if defined(__GNUC__) || defined(__clang__)
+#define TINYEXR_PREFETCH(addr) __builtin_prefetch(addr, 0, 3)
+#elif defined(_MSC_VER)
+#include <intrin.h>
+#define TINYEXR_PREFETCH(addr) _mm_prefetch(reinterpret_cast<const char*>(addr), _MM_HINT_T0)
+#else
+#define TINYEXR_PREFETCH(addr) ((void)0)
+#endif
+#endif
+
+// Optimized delta predictor decode with loop unrolling and prefetching
+// This is the decode operation: d[i] = d[i-1] + d[i] - 128
+// Sequential dependency limits SIMD, but we can still optimize with:
+// - Loop unrolling (4x) to hide instruction latency
+// - Prefetching to reduce memory stalls
+inline void apply_delta_predictor_fast(uint8_t* data, size_t count) {
+  if (count < 2) return;
+
+  // Prefetch ahead
+  TINYEXR_PREFETCH(data + 64);
+
+  size_t i = 1;
+
+  // Process 4 elements at a time with explicit dependency chain
+  // This helps instruction-level parallelism within the dependency chain
+  for (; i + 3 < count; i += 4) {
+    TINYEXR_PREFETCH(data + i + 64);
+
+    // Unrolled with explicit dependency chain
+    int d0 = static_cast<int>(data[i-1]) + static_cast<int>(data[i]) - 128;
+    data[i] = static_cast<uint8_t>(d0);
+
+    int d1 = d0 + static_cast<int>(data[i+1]) - 128;
+    data[i+1] = static_cast<uint8_t>(d1);
+
+    int d2 = d1 + static_cast<int>(data[i+2]) - 128;
+    data[i+2] = static_cast<uint8_t>(d2);
+
+    int d3 = d2 + static_cast<int>(data[i+3]) - 128;
+    data[i+3] = static_cast<uint8_t>(d3);
+  }
+
+  // Handle remainder
+  for (; i < count; i++) {
+    data[i] = static_cast<uint8_t>(data[i-1] + data[i] - 128);
+  }
+}
+
+// Optimized delta predictor encode with loop unrolling
+// This is the encode operation: d[i] = d[i] - d[i-1] + 128
+inline void reverse_delta_predictor_fast(uint8_t* data, size_t count) {
+  if (count < 2) return;
+
+  // Work backwards to avoid overwriting data we need
+  size_t i = count - 1;
+
+  // Unroll 4x
+  for (; i >= 4; i -= 4) {
+    data[i] = static_cast<uint8_t>(data[i] - data[i-1] + 128);
+    data[i-1] = static_cast<uint8_t>(data[i-1] - data[i-2] + 128);
+    data[i-2] = static_cast<uint8_t>(data[i-2] - data[i-3] + 128);
+    data[i-3] = static_cast<uint8_t>(data[i-3] - data[i-4] + 128);
+  }
+
+  // Handle remainder
+  for (; i >= 1; i--) {
+    data[i] = static_cast<uint8_t>(data[i] - data[i-1] + 128);
+  }
+}
+
+// ============================================================================
+// RLE SIMD Optimizations (P2 optimization)
+// ============================================================================
+
+// SIMD-accelerated memset for RLE decompression
+inline void memset_simd(void* dst, int val, size_t bytes) {
+  uint8_t* d = static_cast<uint8_t*>(dst);
+
+#if TINYEXR_SIMD_AVX2
+  if (bytes >= 32) {
+    __m256i v = _mm256_set1_epi8(static_cast<char>(val));
+    while (bytes >= 32) {
+      _mm256_storeu_si256(reinterpret_cast<__m256i*>(d), v);
+      d += 32;
+      bytes -= 32;
+    }
+  }
+#endif
+
+#if TINYEXR_SIMD_SSE2
+  if (bytes >= 16) {
+    __m128i v = _mm_set1_epi8(static_cast<char>(val));
+    while (bytes >= 16) {
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(d), v);
+      d += 16;
+      bytes -= 16;
+    }
+  }
+#elif TINYEXR_SIMD_NEON
+  if (bytes >= 16) {
+    uint8x16_t v = vdupq_n_u8(static_cast<uint8_t>(val));
+    while (bytes >= 16) {
+      vst1q_u8(d, v);
+      d += 16;
+      bytes -= 16;
+    }
+  }
+#endif
+
+  // Handle remainder with standard memset
+  if (bytes > 0) {
+    std::memset(d, val, bytes);
+  }
+}
+
+// Find run length starting from given position
+// Returns the number of consecutive bytes equal to data[0]
+// Used for RLE compression optimization
+inline size_t find_run_length_simd(const uint8_t* data, size_t max_len) {
+  if (max_len == 0) return 0;
+  if (max_len == 1) return 1;
+
+  uint8_t pattern = data[0];
+  size_t i = 1;
+
+#if TINYEXR_SIMD_AVX2
+  // AVX2: Check 32 bytes at a time
+  if (max_len >= 33) {
+    __m256i pat = _mm256_set1_epi8(static_cast<char>(pattern));
+
+    for (; i + 32 <= max_len; i += 32) {
+      __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data + i));
+      __m256i cmp = _mm256_cmpeq_epi8(chunk, pat);
+      uint32_t mask = static_cast<uint32_t>(_mm256_movemask_epi8(cmp));
+
+      if (mask != 0xFFFFFFFFU) {
+        // Found a mismatch - find first differing byte
+#if defined(__GNUC__) || defined(__clang__)
+        return i + static_cast<size_t>(__builtin_ctz(~mask));
+#elif defined(_MSC_VER)
+        unsigned long idx;
+        _BitScanForward(&idx, ~mask);
+        return i + static_cast<size_t>(idx);
+#else
+        // Fallback: scan manually
+        for (size_t j = 0; j < 32; j++) {
+          if (data[i + j] != pattern) return i + j;
+        }
+#endif
+      }
+    }
+  }
+#endif
+
+#if TINYEXR_SIMD_SSE2
+  // SSE2: Check 16 bytes at a time
+  if (max_len >= 17) {
+    __m128i pat = _mm_set1_epi8(static_cast<char>(pattern));
+
+    for (; i + 16 <= max_len; i += 16) {
+      __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i));
+      __m128i cmp = _mm_cmpeq_epi8(chunk, pat);
+      uint32_t mask = static_cast<uint32_t>(_mm_movemask_epi8(cmp));
+
+      if (mask != 0xFFFF) {
+        // Found a mismatch
+#if defined(__GNUC__) || defined(__clang__)
+        return i + static_cast<size_t>(__builtin_ctz(static_cast<uint32_t>(~mask & 0xFFFF)));
+#elif defined(_MSC_VER)
+        unsigned long idx;
+        _BitScanForward(&idx, ~mask & 0xFFFF);
+        return i + static_cast<size_t>(idx);
+#else
+        for (size_t j = 0; j < 16; j++) {
+          if (data[i + j] != pattern) return i + j;
+        }
+#endif
+      }
+    }
+  }
+#elif TINYEXR_SIMD_NEON
+  // NEON: Check 16 bytes at a time
+  if (max_len >= 17) {
+    uint8x16_t pat = vdupq_n_u8(pattern);
+
+    for (; i + 16 <= max_len; i += 16) {
+      uint8x16_t chunk = vld1q_u8(data + i);
+      uint8x16_t cmp = vceqq_u8(chunk, pat);
+
+      // Check if all bytes match (all 0xFF)
+      uint64x2_t cmp64 = vreinterpretq_u64_u8(cmp);
+      if (vgetq_lane_u64(cmp64, 0) != 0xFFFFFFFFFFFFFFFFULL ||
+          vgetq_lane_u64(cmp64, 1) != 0xFFFFFFFFFFFFFFFFULL) {
+        // Found a mismatch - scan to find position
+        for (size_t j = 0; j < 16; j++) {
+          if (data[i + j] != pattern) return i + j;
+        }
+      }
+    }
+  }
+#endif
+
+  // Scalar fallback for remainder
+  for (; i < max_len; i++) {
+    if (data[i] != pattern) return i;
+  }
+
+  return max_len;
+}
+
+// ============================================================================
+// PIZ Wavelet SIMD Optimizations (P2 optimization)
+// ============================================================================
+
+// 14-bit wavelet decode helper (wdec14)
+// a = l + (h & 1) + (h >> 1)
+// b = a - h
+inline void wdec14_scalar(int16_t l, int16_t h, int16_t& a, int16_t& b) {
+  a = static_cast<int16_t>(l + (h & 1) + (h >> 1));
+  b = static_cast<int16_t>(a - h);
+}
+
+// 14-bit wavelet encode helper (wenc14)
+// l = (a + b) >> 1
+// h = a - b
+inline void wenc14_scalar(int16_t a, int16_t b, int16_t& l, int16_t& h) {
+  l = static_cast<int16_t>((a + b) >> 1);
+  h = static_cast<int16_t>(a - b);
+}
+
+// Decode a 2x2 wavelet block
+// Input: p00=L, p01=HL, p10=LH, p11=HH (wavelet coefficients)
+// Output: 4 reconstructed pixel values
+inline void wavelet_decode_2x2(uint16_t* p00, uint16_t* p01,
+                               uint16_t* p10, uint16_t* p11) {
+  int16_t l0 = static_cast<int16_t>(*p00);
+  int16_t h0 = static_cast<int16_t>(*p10);
+  int16_t l1 = static_cast<int16_t>(*p01);
+  int16_t h1 = static_cast<int16_t>(*p11);
+
+  // Step 1: Decode vertical pairs
+  int16_t a0, b0, a1, b1;
+  wdec14_scalar(l0, h0, a0, b0);
+  wdec14_scalar(l1, h1, a1, b1);
+
+  // Step 2: Decode horizontal pairs
+  int16_t aa, ab, ba, bb;
+  wdec14_scalar(a0, a1, aa, ab);
+  wdec14_scalar(b0, b1, ba, bb);
+
+  *p00 = static_cast<uint16_t>(aa);
+  *p01 = static_cast<uint16_t>(ab);
+  *p10 = static_cast<uint16_t>(ba);
+  *p11 = static_cast<uint16_t>(bb);
+}
+
+// Encode a 2x2 pixel block into wavelet coefficients
+inline void wavelet_encode_2x2(uint16_t* p00, uint16_t* p01,
+                               uint16_t* p10, uint16_t* p11) {
+  int16_t aa = static_cast<int16_t>(*p00);
+  int16_t ab = static_cast<int16_t>(*p01);
+  int16_t ba = static_cast<int16_t>(*p10);
+  int16_t bb = static_cast<int16_t>(*p11);
+
+  // Step 1: Encode horizontal pairs
+  int16_t a0, a1, b0, b1;
+  wenc14_scalar(aa, ab, a0, a1);
+  wenc14_scalar(ba, bb, b0, b1);
+
+  // Step 2: Encode vertical pairs
+  int16_t l0, h0, l1, h1;
+  wenc14_scalar(a0, b0, l0, h0);
+  wenc14_scalar(a1, b1, l1, h1);
+
+  *p00 = static_cast<uint16_t>(l0);
+  *p01 = static_cast<uint16_t>(l1);
+  *p10 = static_cast<uint16_t>(h0);
+  *p11 = static_cast<uint16_t>(h1);
+}
+
+#if TINYEXR_SIMD_SSE2
+
+// SSE2: Process 4 2x2 blocks in parallel (8 pixels per row)
+// Input: 4 consecutive 2x2 blocks arranged as:
+//   row0: [L0 HL0 L1 HL1 L2 HL2 L3 HL3]
+//   row1: [LH0 HH0 LH1 HH1 LH2 HH2 LH3 HH3]
+inline void wavelet_decode_4blocks_sse2(uint16_t* row0, uint16_t* row1, size_t stride) {
+  // Load 8 values from each row
+  __m128i r0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row0));
+  __m128i r1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row1));
+
+  // Deinterleave to get L, HL, LH, HH for all 4 blocks
+  // r0 = [L0 HL0 L1 HL1 L2 HL2 L3 HL3]
+  // r1 = [LH0 HH0 LH1 HH1 LH2 HH2 LH3 HH3]
+
+  // Shuffle to separate even/odd positions
+  // Even positions (L, L, L, L): indices 0, 2, 4, 6
+  // Odd positions (HL, HL, HL, HL): indices 1, 3, 5, 7
+  __m128i mask_even = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1,
+                                   13, 12, 9, 8, 5, 4, 1, 0);
+  __m128i mask_odd = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1,
+                                  15, 14, 11, 10, 7, 6, 3, 2);
+
+  // For SSE2 we need to use shuffle differently
+  // Use unpack to separate even/odd 16-bit values
+  __m128i L = _mm_and_si128(r0, _mm_set1_epi32(0x0000FFFF));
+  __m128i HL = _mm_srli_epi32(r0, 16);
+  __m128i LH = _mm_and_si128(r1, _mm_set1_epi32(0x0000FFFF));
+  __m128i HH = _mm_srli_epi32(r1, 16);
+
+  // Pack to get 4 values each
+  L = _mm_packs_epi32(L, _mm_setzero_si128());
+  HL = _mm_packs_epi32(HL, _mm_setzero_si128());
+  LH = _mm_packs_epi32(LH, _mm_setzero_si128());
+  HH = _mm_packs_epi32(HH, _mm_setzero_si128());
+
+  // wdec14: a = l + (h & 1) + (h >> 1), b = a - h
+  // Step 1: Decode vertical (L, LH -> A0, B0) and (HL, HH -> A1, B1)
+  __m128i one = _mm_set1_epi16(1);
+
+  // A0 = L + (LH & 1) + (LH >> 1)
+  __m128i LH_and1 = _mm_and_si128(LH, one);
+  __m128i LH_shr1 = _mm_srai_epi16(LH, 1);
+  __m128i A0 = _mm_add_epi16(L, LH_and1);
+  A0 = _mm_add_epi16(A0, LH_shr1);
+  // B0 = A0 - LH
+  __m128i B0 = _mm_sub_epi16(A0, LH);
+
+  // A1 = HL + (HH & 1) + (HH >> 1)
+  __m128i HH_and1 = _mm_and_si128(HH, one);
+  __m128i HH_shr1 = _mm_srai_epi16(HH, 1);
+  __m128i A1 = _mm_add_epi16(HL, HH_and1);
+  A1 = _mm_add_epi16(A1, HH_shr1);
+  // B1 = A1 - HH
+  __m128i B1 = _mm_sub_epi16(A1, HH);
+
+  // Step 2: Decode horizontal (A0, A1 -> AA, AB) and (B0, B1 -> BA, BB)
+  // AA = A0 + (A1 & 1) + (A1 >> 1)
+  __m128i A1_and1 = _mm_and_si128(A1, one);
+  __m128i A1_shr1 = _mm_srai_epi16(A1, 1);
+  __m128i AA = _mm_add_epi16(A0, A1_and1);
+  AA = _mm_add_epi16(AA, A1_shr1);
+  // AB = AA - A1
+  __m128i AB = _mm_sub_epi16(AA, A1);
+
+  // BA = B0 + (B1 & 1) + (B1 >> 1)
+  __m128i B1_and1 = _mm_and_si128(B1, one);
+  __m128i B1_shr1 = _mm_srai_epi16(B1, 1);
+  __m128i BA = _mm_add_epi16(B0, B1_and1);
+  BA = _mm_add_epi16(BA, B1_shr1);
+  // BB = BA - B1
+  __m128i BB = _mm_sub_epi16(BA, B1);
+
+  // Interleave back: row0 = [AA0 AB0 AA1 AB1 AA2 AB2 AA3 AB3]
+  //                  row1 = [BA0 BB0 BA1 BB1 BA2 BB2 BA3 BB3]
+  __m128i out0 = _mm_unpacklo_epi16(AA, AB);
+  __m128i out1 = _mm_unpacklo_epi16(BA, BB);
+
+  _mm_storeu_si128(reinterpret_cast<__m128i*>(row0), out0);
+  _mm_storeu_si128(reinterpret_cast<__m128i*>(row1), out1);
+}
+
+#endif  // TINYEXR_SIMD_SSE2
+
+#if TINYEXR_SIMD_NEON
+
+// NEON: Process 4 2x2 blocks in parallel
+inline void wavelet_decode_4blocks_neon(uint16_t* row0, uint16_t* row1, size_t stride) {
+  // Load 8 values from each row
+  uint16x8_t r0 = vld1q_u16(row0);
+  uint16x8_t r1 = vld1q_u16(row1);
+
+  // Deinterleave using NEON's native support
+  uint16x4x2_t r0_deint = vuzp_u16(vget_low_u16(r0), vget_high_u16(r0));
+  uint16x4x2_t r1_deint = vuzp_u16(vget_low_u16(r1), vget_high_u16(r1));
+
+  int16x4_t L = vreinterpret_s16_u16(r0_deint.val[0]);   // L values
+  int16x4_t HL = vreinterpret_s16_u16(r0_deint.val[1]);  // HL values
+  int16x4_t LH = vreinterpret_s16_u16(r1_deint.val[0]);  // LH values
+  int16x4_t HH = vreinterpret_s16_u16(r1_deint.val[1]);  // HH values
+
+  // wdec14: a = l + (h & 1) + (h >> 1), b = a - h
+  int16x4_t one = vdup_n_s16(1);
+
+  // Step 1: Decode vertical
+  int16x4_t LH_and1 = vand_s16(LH, one);
+  int16x4_t LH_shr1 = vshr_n_s16(LH, 1);
+  int16x4_t A0 = vadd_s16(vadd_s16(L, LH_and1), LH_shr1);
+  int16x4_t B0 = vsub_s16(A0, LH);
+
+  int16x4_t HH_and1 = vand_s16(HH, one);
+  int16x4_t HH_shr1 = vshr_n_s16(HH, 1);
+  int16x4_t A1 = vadd_s16(vadd_s16(HL, HH_and1), HH_shr1);
+  int16x4_t B1 = vsub_s16(A1, HH);
+
+  // Step 2: Decode horizontal
+  int16x4_t A1_and1 = vand_s16(A1, one);
+  int16x4_t A1_shr1 = vshr_n_s16(A1, 1);
+  int16x4_t AA = vadd_s16(vadd_s16(A0, A1_and1), A1_shr1);
+  int16x4_t AB = vsub_s16(AA, A1);
+
+  int16x4_t B1_and1 = vand_s16(B1, one);
+  int16x4_t B1_shr1 = vshr_n_s16(B1, 1);
+  int16x4_t BA = vadd_s16(vadd_s16(B0, B1_and1), B1_shr1);
+  int16x4_t BB = vsub_s16(BA, B1);
+
+  // Interleave back
+  uint16x4x2_t out0_int = vzip_u16(vreinterpret_u16_s16(AA), vreinterpret_u16_s16(AB));
+  uint16x4x2_t out1_int = vzip_u16(vreinterpret_u16_s16(BA), vreinterpret_u16_s16(BB));
+
+  uint16x8_t out0 = vcombine_u16(out0_int.val[0], out0_int.val[1]);
+  uint16x8_t out1 = vcombine_u16(out1_int.val[0], out1_int.val[1]);
+
+  vst1q_u16(row0, out0);
+  vst1q_u16(row1, out1);
+}
+
+#endif  // TINYEXR_SIMD_NEON
+
+// Generic wavelet decode for a row of 2x2 blocks
+// Processes as many blocks as possible with SIMD, falls back to scalar
+inline void wavelet_decode_row(uint16_t* row0, uint16_t* row1,
+                               size_t width, size_t stride) {
+  size_t x = 0;
+
+#if TINYEXR_SIMD_SSE2
+  // Process 4 blocks (8 pixels) at a time
+  for (; x + 8 <= width; x += 8) {
+    wavelet_decode_4blocks_sse2(row0 + x, row1 + x, stride);
+  }
+#elif TINYEXR_SIMD_NEON
+  // Process 4 blocks (8 pixels) at a time
+  for (; x + 8 <= width; x += 8) {
+    wavelet_decode_4blocks_neon(row0 + x, row1 + x, stride);
+  }
+#endif
+
+  // Scalar fallback for remaining blocks
+  for (; x + 2 <= width; x += 2) {
+    wavelet_decode_2x2(row0 + x, row0 + x + 1, row1 + x, row1 + x + 1);
+  }
+}
+
+// ============================================================================
+// LUT Application with Prefetching (P2 optimization)
+// ============================================================================
+
+// Apply lookup table with software prefetching
+// This is used in PIZ compression for applying the reverse LUT
+inline void apply_lut_prefetch(uint16_t* data, size_t count, const uint16_t* lut) {
+  size_t i = 0;
+
+  // Prefetch distance - tune based on cache characteristics
+  const size_t PREFETCH_DIST = 32;
+
+  for (; i + PREFETCH_DIST < count; i++) {
+    // Prefetch future LUT entries
+    if ((i & 15) == 0) {
+      TINYEXR_PREFETCH(&lut[data[i + PREFETCH_DIST]]);
+      if (i + PREFETCH_DIST + 16 < count) {
+        TINYEXR_PREFETCH(&lut[data[i + PREFETCH_DIST + 16]]);
+      }
+    }
+    data[i] = lut[data[i]];
+  }
+
+  // Handle remainder without prefetch
+  for (; i < count; i++) {
+    data[i] = lut[data[i]];
+  }
+}
+
+#if TINYEXR_SIMD_AVX2
+
+// AVX2: Apply LUT using gather instructions
+// This can be faster than scalar for certain access patterns
+inline void apply_lut_avx2(uint16_t* data, size_t count, const uint16_t* lut) {
+  size_t i = 0;
+
+  // Process 8 values at a time using gather
+  for (; i + 8 <= count; i += 8) {
+    // Load 8 16-bit indices and zero-extend to 32-bit
+    __m128i indices16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i));
+    __m256i indices32 = _mm256_cvtepu16_epi32(indices16);
+
+    // Gather 8 values from LUT
+    // Scale is 2 because LUT elements are 16-bit
+    __m256i values32 = _mm256_i32gather_epi32(
+      reinterpret_cast<const int*>(lut), indices32, 2);
+
+    // Pack back to 16-bit
+    // Extract low 16 bits of each 32-bit value
+    __m256i mask16 = _mm256_set1_epi32(0x0000FFFF);
+    values32 = _mm256_and_si256(values32, mask16);
+
+    // Pack 32-bit to 16-bit
+    __m128i lo = _mm256_castsi256_si128(values32);
+    __m128i hi = _mm256_extracti128_si256(values32, 1);
+    __m128i packed = _mm_packus_epi32(lo, hi);
+
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(data + i), packed);
+  }
+
+  // Scalar fallback for remainder
+  for (; i < count; i++) {
+    data[i] = lut[data[i]];
+  }
+}
+
+#endif  // TINYEXR_SIMD_AVX2
+
+// ============================================================================
 // Utility Functions
 // ============================================================================
 

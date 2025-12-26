@@ -256,6 +256,152 @@ void test_zlib_compatibility() {
 
   printf("  Passed zlib compatibility tests\n\n");
 }
+
+void test_dynamic_huffman_long_codes() {
+  printf("=== Test: Dynamic Huffman with Long Codes ===\n");
+
+  // Create test data with a skewed distribution
+  // Use many common bytes and few rare bytes to force zlib to create
+  // long Huffman codes for rare symbols
+  std::vector<uint8_t> test_data;
+  test_data.reserve(4096);
+
+  // Add mostly common bytes (will get short codes)
+  for (int i = 0; i < 3000; i++) {
+    test_data.push_back('A');  // Very common
+  }
+  for (int i = 0; i < 500; i++) {
+    test_data.push_back('B');  // Common
+  }
+  for (int i = 0; i < 200; i++) {
+    test_data.push_back('C');  // Less common
+  }
+  // Add rare bytes (will get long codes)
+  for (int i = 0; i < 50; i++) {
+    test_data.push_back(static_cast<uint8_t>(i + 100));  // Rare
+  }
+  // Add very rare bytes (might get codes > 10 bits)
+  for (int i = 0; i < 5; i++) {
+    test_data.push_back(static_cast<uint8_t>(200 + i));  // Very rare
+  }
+
+  // Shuffle to make it more interesting for compression
+  for (size_t i = test_data.size() - 1; i > 0; i--) {
+    size_t j = i * 1103515245 % (i + 1);  // Simple deterministic shuffle
+    std::swap(test_data[i], test_data[j]);
+  }
+
+  // Compress with zlib using best compression (to force dynamic blocks)
+  std::vector<uint8_t> compressed(compressBound(test_data.size()));
+  uLongf compressed_len = compressed.size();
+
+  // Use deflateInit2 with Z_BEST_COMPRESSION for more dynamic codes
+  z_stream strm;
+  strm.zalloc = Z_NULL;
+  strm.zfree = Z_NULL;
+  strm.opaque = Z_NULL;
+  int ret = deflateInit2(&strm, Z_BEST_COMPRESSION, Z_DEFLATED, 15, 9, Z_DEFAULT_STRATEGY);
+  TEST_ASSERT(ret == Z_OK, "deflateInit2 succeeds");
+
+  strm.next_in = test_data.data();
+  strm.avail_in = static_cast<uInt>(test_data.size());
+  strm.next_out = compressed.data();
+  strm.avail_out = static_cast<uInt>(compressed.size());
+
+  ret = deflate(&strm, Z_FINISH);
+  TEST_ASSERT(ret == Z_STREAM_END, "deflate finishes");
+
+  compressed_len = strm.total_out;
+  deflateEnd(&strm);
+
+  printf("  Compressed %zu bytes to %lu bytes (%.1f%%)\n",
+         test_data.size(), compressed_len, 100.0 * compressed_len / test_data.size());
+
+  // Decompress with our implementation
+  std::vector<uint8_t> decompressed(test_data.size() + 256);
+  size_t decompressed_len = decompressed.size();
+
+  bool ok = inflate_zlib(compressed.data(), compressed_len,
+                        decompressed.data(), &decompressed_len);
+
+  TEST_ASSERT(ok, "Dynamic Huffman inflate succeeds");
+  TEST_ASSERT(decompressed_len == test_data.size(), "Decompressed length matches");
+  TEST_ASSERT(memcmp(decompressed.data(), test_data.data(), test_data.size()) == 0,
+              "Decompressed content matches");
+
+  printf("  Passed dynamic Huffman long codes tests\n\n");
+}
+
+void test_real_world_deflate() {
+  printf("=== Test: Real World Deflate Patterns ===\n");
+
+  // Test 1: Random-ish data
+  std::vector<uint8_t> random_data(8192);
+  for (size_t i = 0; i < random_data.size(); i++) {
+    random_data[i] = static_cast<uint8_t>((i * 1103515245 + 12345) >> 16);
+  }
+
+  std::vector<uint8_t> compressed(compressBound(random_data.size()));
+  uLongf compressed_len = compressed.size();
+  int ret = compress(compressed.data(), &compressed_len,
+                    random_data.data(), random_data.size());
+  TEST_ASSERT(ret == Z_OK, "Compress random data");
+
+  std::vector<uint8_t> decompressed(random_data.size() + 256);
+  size_t decompressed_len = decompressed.size();
+  bool ok = inflate_zlib(compressed.data(), compressed_len,
+                        decompressed.data(), &decompressed_len);
+  TEST_ASSERT(ok, "Decompress random data");
+  TEST_ASSERT(decompressed_len == random_data.size(), "Random data length matches");
+  TEST_ASSERT(memcmp(decompressed.data(), random_data.data(), random_data.size()) == 0,
+              "Random data content matches");
+
+  // Test 2: Highly repetitive data (tests match copying)
+  std::vector<uint8_t> repeat_data(16384);
+  for (size_t i = 0; i < repeat_data.size(); i++) {
+    repeat_data[i] = static_cast<uint8_t>((i % 4) + 'A');  // ABCD pattern
+  }
+
+  compressed.resize(compressBound(repeat_data.size()));
+  compressed_len = compressed.size();
+  ret = compress(compressed.data(), &compressed_len,
+                repeat_data.data(), repeat_data.size());
+  TEST_ASSERT(ret == Z_OK, "Compress repetitive data");
+
+  printf("  Repetitive data: %zu bytes -> %lu bytes (%.1f%%)\n",
+         repeat_data.size(), compressed_len, 100.0 * compressed_len / repeat_data.size());
+
+  decompressed.resize(repeat_data.size() + 256);
+  decompressed_len = decompressed.size();
+  ok = inflate_zlib(compressed.data(), compressed_len,
+                   decompressed.data(), &decompressed_len);
+  TEST_ASSERT(ok, "Decompress repetitive data");
+  TEST_ASSERT(decompressed_len == repeat_data.size(), "Repetitive data length matches");
+  TEST_ASSERT(memcmp(decompressed.data(), repeat_data.data(), repeat_data.size()) == 0,
+              "Repetitive data content matches");
+
+  // Test 3: All zeros (tests RLE path in match copy)
+  std::vector<uint8_t> zero_data(8192, 0);
+
+  compressed.resize(compressBound(zero_data.size()));
+  compressed_len = compressed.size();
+  ret = compress(compressed.data(), &compressed_len,
+                zero_data.data(), zero_data.size());
+  TEST_ASSERT(ret == Z_OK, "Compress zero data");
+
+  printf("  Zero data: %zu bytes -> %lu bytes\n", zero_data.size(), compressed_len);
+
+  decompressed.resize(zero_data.size() + 256);
+  decompressed_len = decompressed.size();
+  ok = inflate_zlib(compressed.data(), compressed_len,
+                   decompressed.data(), &decompressed_len);
+  TEST_ASSERT(ok, "Decompress zero data");
+  TEST_ASSERT(decompressed_len == zero_data.size(), "Zero data length matches");
+  TEST_ASSERT(memcmp(decompressed.data(), zero_data.data(), zero_data.size()) == 0,
+              "Zero data content matches");
+
+  printf("  Passed real world deflate tests\n\n");
+}
 #endif
 
 // ============================================================================
@@ -391,6 +537,8 @@ int main(int argc, char** argv) {
 
 #ifdef HAVE_ZLIB
   test_zlib_compatibility();
+  test_dynamic_huffman_long_codes();
+  test_real_world_deflate();
 #endif
 
   // Run benchmarks

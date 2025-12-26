@@ -9,9 +9,307 @@
 
 #include "tinyexr_v2.hh"
 #include <cstring>
+#include <algorithm>
+
+// ============================================================================
+// Decompression backend configuration
+// ============================================================================
+//
+// V2 API decompression backend priority:
+//   1. TINYEXR_V2_USE_CUSTOM_DEFLATE (default=1) - Custom SIMD-optimized deflate
+//   2. TINYEXR_USE_ZLIB - System zlib
+//   3. TINYEXR_USE_MINIZ - Miniz (bundled)
+//
+// To use system zlib instead of custom deflate:
+//   #define TINYEXR_V2_USE_CUSTOM_DEFLATE 0
+//   #define TINYEXR_USE_ZLIB 1
+//
+// To use miniz instead of custom deflate:
+//   #define TINYEXR_V2_USE_CUSTOM_DEFLATE 0
+//   #define TINYEXR_USE_MINIZ 1
+
+// Default: use custom SIMD-optimized deflate
+#ifndef TINYEXR_V2_USE_CUSTOM_DEFLATE
+#define TINYEXR_V2_USE_CUSTOM_DEFLATE 1
+#endif
+
+// Custom deflate uses tinyexr_huffman.hh
+#if TINYEXR_V2_USE_CUSTOM_DEFLATE
+#include "tinyexr_huffman.hh"
+#include "tinyexr_piz.hh"
+#endif
+
+// Fallback: miniz or zlib for when custom deflate is disabled
+#if !TINYEXR_V2_USE_CUSTOM_DEFLATE
+#if !defined(TINYEXR_USE_MINIZ) && !defined(TINYEXR_USE_ZLIB)
+// Default to zlib if available, otherwise miniz
+#if defined(__has_include)
+#if __has_include(<zlib.h>)
+#define TINYEXR_USE_ZLIB 1
+#define TINYEXR_USE_MINIZ 0
+#else
+#define TINYEXR_USE_ZLIB 0
+#define TINYEXR_USE_MINIZ 1
+#endif
+#else
+#define TINYEXR_USE_ZLIB 1
+#define TINYEXR_USE_MINIZ 0
+#endif
+#endif
+
+#if TINYEXR_USE_MINIZ
+#include "miniz.h"
+#elif TINYEXR_USE_ZLIB
+#include <zlib.h>
+#endif
+#endif
 
 namespace tinyexr {
 namespace v2 {
+
+// ============================================================================
+// Compression constants
+// ============================================================================
+
+enum CompressionType {
+  COMPRESSION_NONE = 0,
+  COMPRESSION_RLE = 1,
+  COMPRESSION_ZIPS = 2,  // ZIP single scanline
+  COMPRESSION_ZIP = 3,   // ZIP 16 scanlines
+  COMPRESSION_PIZ = 4,
+  COMPRESSION_PXR24 = 5,
+  COMPRESSION_B44 = 6,
+  COMPRESSION_B44A = 7,
+  COMPRESSION_DWAA = 8,
+  COMPRESSION_DWAB = 9
+};
+
+// Pixel types
+enum PixelType {
+  PIXEL_TYPE_UINT = 0,
+  PIXEL_TYPE_HALF = 1,
+  PIXEL_TYPE_FLOAT = 2
+};
+
+// ============================================================================
+// Helper: RLE decompression (from OpenEXR)
+// ============================================================================
+
+static int rleUncompress(int inLength, int maxLength,
+                         const signed char* in, char* out) {
+  char* outStart = out;
+  const char* outEnd = out + maxLength;
+  const signed char* inEnd = in + inLength;
+
+  while (in < inEnd) {
+    if (*in < 0) {
+      int count = -static_cast<int>(*in++);
+      if (out + count > outEnd) return 0;
+      if (in + count > inEnd) return 0;
+      std::memcpy(out, in, static_cast<size_t>(count));
+      out += count;
+      in += count;
+    } else {
+      int count = static_cast<int>(*in++) + 1;
+      if (out + count > outEnd) return 0;
+      if (in >= inEnd) return 0;
+      std::memset(out, *in++, static_cast<size_t>(count));
+      out += count;
+    }
+  }
+  return static_cast<int>(out - outStart);
+}
+
+// ============================================================================
+// Helper: Decompression functions
+// ============================================================================
+
+static bool DecompressZipV2(uint8_t* dst, size_t* uncompressed_size,
+                            const uint8_t* src, size_t src_size,
+                            ScratchPool& pool) {
+  if (*uncompressed_size == src_size) {
+    // Not compressed
+    std::memcpy(dst, src, src_size);
+    return true;
+  }
+
+  uint8_t* tmpBuf = pool.get_buffer(*uncompressed_size);
+
+#if TINYEXR_V2_USE_CUSTOM_DEFLATE
+  // Use custom SIMD-optimized deflate decoder
+  tinyexr::huffman::dfl::DeflateOptions opts;
+  opts.max_output_size = *uncompressed_size;
+  auto result = tinyexr::huffman::dfl::inflate_zlib_safe(
+      src, src_size, tmpBuf, *uncompressed_size, opts);
+  if (!result.success) {
+    return false;
+  }
+  *uncompressed_size = result.bytes_written;
+#elif TINYEXR_USE_MINIZ
+  mz_ulong dest_len = static_cast<mz_ulong>(*uncompressed_size);
+  int ret = mz_uncompress(tmpBuf, &dest_len, src, static_cast<mz_ulong>(src_size));
+  if (ret != MZ_OK) {
+    return false;
+  }
+  *uncompressed_size = static_cast<size_t>(dest_len);
+#elif TINYEXR_USE_ZLIB
+  uLongf dest_len = static_cast<uLongf>(*uncompressed_size);
+  int ret = uncompress(tmpBuf, &dest_len, src, static_cast<uLong>(src_size));
+  if (ret != Z_OK) {
+    return false;
+  }
+  *uncompressed_size = static_cast<size_t>(dest_len);
+#else
+  // Fallback - no decompression backend available
+  (void)tmpBuf; (void)src; (void)src_size;
+  return false;
+#endif
+
+  // Predictor (using optimized version if available)
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+  tinyexr::simd::apply_delta_predictor_fast(tmpBuf, *uncompressed_size);
+#else
+  if (*uncompressed_size > 1) {
+    uint8_t* t = tmpBuf + 1;
+    uint8_t* stop = tmpBuf + *uncompressed_size;
+    while (t < stop) {
+      int d = static_cast<int>(t[-1]) + static_cast<int>(t[0]) - 128;
+      t[0] = static_cast<uint8_t>(d);
+      ++t;
+    }
+  }
+#endif
+
+  // Reorder (using optimized version if available)
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+  tinyexr::simd::unreorder_bytes_after_decompression(tmpBuf, dst, *uncompressed_size);
+#else
+  {
+    const uint8_t* t1 = tmpBuf;
+    const uint8_t* t2 = tmpBuf + (*uncompressed_size + 1) / 2;
+    uint8_t* s = dst;
+    uint8_t* stop = s + *uncompressed_size;
+    while (s < stop) {
+      if (s < stop) *s++ = *t1++;
+      if (s < stop) *s++ = *t2++;
+    }
+  }
+#endif
+
+  return true;
+}
+
+static bool DecompressRleV2(uint8_t* dst, size_t uncompressed_size,
+                            const uint8_t* src, size_t src_size,
+                            ScratchPool& pool) {
+  if (uncompressed_size == src_size) {
+    std::memcpy(dst, src, src_size);
+    return true;
+  }
+
+  if (src_size <= 2) {
+    return false;
+  }
+
+  uint8_t* tmpBuf = pool.get_buffer(uncompressed_size);
+
+  int ret = rleUncompress(static_cast<int>(src_size),
+                          static_cast<int>(uncompressed_size),
+                          reinterpret_cast<const signed char*>(src),
+                          reinterpret_cast<char*>(tmpBuf));
+  if (ret != static_cast<int>(uncompressed_size)) {
+    return false;
+  }
+
+  // Predictor
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+  tinyexr::simd::apply_delta_predictor_fast(tmpBuf, uncompressed_size);
+#else
+  if (uncompressed_size > 1) {
+    uint8_t* t = tmpBuf + 1;
+    uint8_t* stop = tmpBuf + uncompressed_size;
+    while (t < stop) {
+      int d = static_cast<int>(t[-1]) + static_cast<int>(t[0]) - 128;
+      t[0] = static_cast<uint8_t>(d);
+      ++t;
+    }
+  }
+#endif
+
+  // Reorder
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+  tinyexr::simd::unreorder_bytes_after_decompression(tmpBuf, dst, uncompressed_size);
+#else
+  {
+    const uint8_t* t1 = tmpBuf;
+    const uint8_t* t2 = tmpBuf + (uncompressed_size + 1) / 2;
+    uint8_t* s = dst;
+    uint8_t* stop = s + uncompressed_size;
+    while (s < stop) {
+      if (s < stop) *s++ = *t1++;
+      if (s < stop) *s++ = *t2++;
+    }
+  }
+#endif
+
+  return true;
+}
+
+// ============================================================================
+// Helper: FP16 to FP32 conversion
+// ============================================================================
+
+static float HalfToFloat(uint16_t h) {
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+  return tinyexr::simd::half_to_float_scalar(h);
+#else
+  union { uint32_t u; float f; } o;
+  static const union { uint32_t u; float f; } magic = {113U << 23};
+  static const uint32_t shifted_exp = 0x7c00U << 13;
+
+  o.u = (h & 0x7fffU) << 13;
+  uint32_t exp_ = shifted_exp & o.u;
+  o.u += (127 - 15) << 23;
+
+  if (exp_ == shifted_exp) {
+    o.u += (128 - 16) << 23;
+  } else if (exp_ == 0) {
+    o.u += 1 << 23;
+    o.f -= magic.f;
+  }
+
+  o.u |= (h & 0x8000U) << 16;
+  return o.f;
+#endif
+}
+
+// ============================================================================
+// Helper: Get scanlines per block for compression type
+// ============================================================================
+
+static int GetScanlinesPerBlock(int compression) {
+  switch (compression) {
+    case COMPRESSION_NONE:
+    case COMPRESSION_RLE:
+    case COMPRESSION_ZIPS:
+      return 1;
+    case COMPRESSION_ZIP:
+      return 16;
+    case COMPRESSION_PIZ:
+      return 32;
+    case COMPRESSION_PXR24:
+      return 16;
+    case COMPRESSION_B44:
+    case COMPRESSION_B44A:
+      return 32;
+    case COMPRESSION_DWAA:
+      return 32;
+    case COMPRESSION_DWAB:
+      return 256;
+    default:
+      return 1;
+  }
+}
 
 // ============================================================================
 // Implementation of parser functions
@@ -183,11 +481,76 @@ Result<Header> ParseHeader(Reader& reader, const Version& version) {
     // Parse specific attributes we care about
     if (attr_name == "channels" && attr_type == "chlist") {
       has_channels = true;
-      // For now, skip detailed parsing - just consume the bytes
-      // TODO: Implement full channel list parsing
-      if (!reader.seek_relative(data_size)) {
-        return Result<Header>::error(reader.last_error());
+
+      // Parse channel list
+      size_t chlist_end = reader.tell() + data_size;
+
+      while (reader.tell() < chlist_end) {
+        // Check for null terminator (end of channel list)
+        uint8_t name_first;
+        size_t name_start = reader.tell();
+        if (!reader.read1(&name_first)) {
+          return Result<Header>::error(reader.last_error());
+        }
+        if (name_first == 0) {
+          break;  // End of channel list
+        }
+        reader.seek(name_start);
+
+        // Read channel name
+        std::string channel_name;
+        if (!reader.read_string(&channel_name, 256)) {
+          return Result<Header>::error(reader.last_error());
+        }
+
+        Channel ch;
+        ch.name = channel_name;
+
+        // Read pixel type (4 bytes)
+        uint32_t pixel_type;
+        if (!reader.read4(&pixel_type)) {
+          return Result<Header>::error(reader.last_error());
+        }
+        ch.pixel_type = static_cast<int>(pixel_type);
+
+        // Read pLinear (1 byte) + reserved (3 bytes)
+        uint8_t plinear;
+        if (!reader.read1(&plinear)) {
+          return Result<Header>::error(reader.last_error());
+        }
+        ch.p_linear = (plinear != 0);
+
+        // Skip reserved (3 bytes)
+        uint8_t reserved[3];
+        if (!reader.read(3, reserved)) {
+          return Result<Header>::error(reader.last_error());
+        }
+
+        // Read x sampling (4 bytes)
+        uint32_t x_sampling;
+        if (!reader.read4(&x_sampling)) {
+          return Result<Header>::error(reader.last_error());
+        }
+        ch.x_sampling = static_cast<int>(x_sampling);
+
+        // Read y sampling (4 bytes)
+        uint32_t y_sampling;
+        if (!reader.read4(&y_sampling)) {
+          return Result<Header>::error(reader.last_error());
+        }
+        ch.y_sampling = static_cast<int>(y_sampling);
+
+        header.channels.push_back(ch);
       }
+
+      // Sort channels by name for consistent ordering
+      std::sort(header.channels.begin(), header.channels.end(),
+                [](const Channel& a, const Channel& b) {
+                  return a.name < b.name;
+                });
+
+      // Ensure we're at the end of the attribute data
+      reader.seek(data_start + data_size);
     }
     else if (attr_name == "compression" && attr_type == "compression") {
       has_compression = true;
@@ -403,12 +766,252 @@ Result<ImageData> LoadFromMemory(const uint8_t* data, size_t size) {
     return result;
   }
 
-  // For now, return partial result with header info
-  // TODO: Implement full image data loading
+  // Setup image data
   ImageData img_data;
   img_data.header = header_result.value;
   img_data.width = header_result.value.data_window.width();
   img_data.height = header_result.value.data_window.height();
+  img_data.num_channels = static_cast<int>(header_result.value.channels.size());
+
+  const Header& hdr = header_result.value;
+  int width = img_data.width;
+  int height = img_data.height;
+
+  // Allocate RGBA output buffer
+  img_data.rgba.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4, 0.0f);
+
+  // Calculate bytes per pixel for each channel and total
+  size_t bytes_per_pixel = 0;
+  std::vector<size_t> channel_offsets;
+  std::vector<int> channel_sizes;  // bytes per pixel for each channel
+
+  for (size_t i = 0; i < hdr.channels.size(); i++) {
+    channel_offsets.push_back(bytes_per_pixel);
+    int sz = 0;
+    switch (hdr.channels[i].pixel_type) {
+      case PIXEL_TYPE_UINT:  sz = 4; break;
+      case PIXEL_TYPE_HALF:  sz = 2; break;
+      case PIXEL_TYPE_FLOAT: sz = 4; break;
+      default: sz = 4; break;
+    }
+    channel_sizes.push_back(sz);
+    bytes_per_pixel += static_cast<size_t>(sz);
+  }
+
+  size_t pixel_data_size = bytes_per_pixel * static_cast<size_t>(width);
+  int scanlines_per_block = GetScanlinesPerBlock(hdr.compression);
+  int num_blocks = (height + scanlines_per_block - 1) / scanlines_per_block;
+
+  // Check compression type support
+  if (hdr.compression != COMPRESSION_NONE &&
+      hdr.compression != COMPRESSION_RLE &&
+      hdr.compression != COMPRESSION_ZIPS &&
+      hdr.compression != COMPRESSION_ZIP &&
+      hdr.compression != COMPRESSION_PIZ) {
+    Result<ImageData> result = Result<ImageData>::ok(img_data);
+    result.warnings = version_result.warnings;
+    for (size_t i = 0; i < header_result.warnings.size(); i++) {
+      result.warnings.push_back(header_result.warnings[i]);
+    }
+    result.add_warning("Compression type " + std::to_string(hdr.compression) +
+                       " not yet supported in V2 API. Pixel data not loaded.");
+    return result;
+  }
+
+  // Read offset table
+  reader.set_context("Reading offset table");
+  std::vector<uint64_t> offsets(static_cast<size_t>(num_blocks));
+  for (int i = 0; i < num_blocks; i++) {
+    uint64_t offset;
+    if (!reader.read8(&offset)) {
+      Result<ImageData> result;
+      result.success = false;
+      result.errors.push_back(ErrorInfo(ErrorCode::InvalidData,
+                                        "Failed to read offset table entry " + std::to_string(i),
+                                        reader.context(), reader.tell()));
+      return result;
+    }
+    offsets[static_cast<size_t>(i)] = offset;
+  }
+
+  // Get scratch pool for decompression
+  ScratchPool& pool = get_scratch_pool();
+
+  // Map channel names to output indices (RGBA)
+  auto GetOutputIndex = [&](const std::string& name) -> int {
+    if (name == "R" || name == "r") return 0;
+    if (name == "G" || name == "g") return 1;
+    if (name == "B" || name == "b") return 2;
+    if (name == "A" || name == "a") return 3;
+    if (name == "Y" || name == "y") return 0;  // Luminance -> R
+    return -1;  // Unknown channel
+  };
+
+  // Build channel mapping
+  std::vector<int> channel_output_idx;
+  for (size_t i = 0; i < hdr.channels.size(); i++) {
+    channel_output_idx.push_back(GetOutputIndex(hdr.channels[i].name));
+  }
+
+  // Decompress buffer
+  std::vector<uint8_t> decomp_buf(pixel_data_size * static_cast<size_t>(scanlines_per_block));
+
+  // Process each scanline block
+  reader.set_context("Decoding scanline data");
+
+  for (int block = 0; block < num_blocks; block++) {
+    // Seek to block
+    if (!reader.seek(static_cast<size_t>(offsets[static_cast<size_t>(block)]))) {
+      Result<ImageData> result;
+      result.success = false;
+      result.errors.push_back(ErrorInfo(ErrorCode::OutOfBounds,
+                                        "Failed to seek to block " + std::to_string(block),
+                                        reader.context(), reader.tell()));
+      return result;
+    }
+
+    // Read y coordinate (4 bytes)
+    uint32_t y_coord;
+    if (!reader.read4(&y_coord)) {
+      Result<ImageData> result;
+      result.success = false;
+      result.errors.push_back(reader.last_error());
+      return result;
+    }
+
+    // Read data size (4 bytes)
+    uint32_t data_size;
+    if (!reader.read4(&data_size)) {
+      Result<ImageData> result;
+      result.success = false;
+      result.errors.push_back(reader.last_error());
+      return result;
+    }
+
+    // Calculate number of scanlines in this block
+    int y_start = static_cast<int>(y_coord) - hdr.data_window.min_y;
+    int num_lines = std::min(scanlines_per_block, height - y_start);
+    if (num_lines <= 0) continue;
+
+    size_t expected_size = pixel_data_size * static_cast<size_t>(num_lines);
+
+    // Read compressed data
+    const uint8_t* block_data = data + reader.tell();
+    if (reader.tell() + data_size > size) {
+      Result<ImageData> result;
+      result.success = false;
+      result.errors.push_back(ErrorInfo(ErrorCode::OutOfBounds,
+                                        "Block data exceeds file size",
+                                        reader.context(), reader.tell()));
+      return result;
+    }
+
+    // Decompress
+    bool decomp_ok = false;
+    switch (hdr.compression) {
+      case COMPRESSION_NONE:
+        if (data_size == expected_size) {
+          std::memcpy(decomp_buf.data(), block_data, expected_size);
+          decomp_ok = true;
+        }
+        break;
+
+      case COMPRESSION_RLE:
+        decomp_ok = DecompressRleV2(decomp_buf.data(), expected_size,
+                                     block_data, data_size, pool);
+        break;
+
+      case COMPRESSION_ZIPS:
+      case COMPRESSION_ZIP: {
+        size_t uncomp_size = expected_size;
+        decomp_ok = DecompressZipV2(decomp_buf.data(), &uncomp_size,
+                                     block_data, data_size, pool);
+        break;
+      }
+
+#if TINYEXR_V2_USE_CUSTOM_DEFLATE
+      case COMPRESSION_PIZ: {
+        auto piz_result = tinyexr::piz::DecompressPizV2(
+            decomp_buf.data(), expected_size,
+            block_data, data_size,
+            static_cast<int>(hdr.channels.size()), hdr.channels.data(),
+            width, num_lines);
+        decomp_ok = piz_result.success;
+        break;
+      }
+#endif
+
+      default:
+        decomp_ok = false;
+        break;
+    }
+
+    if (!decomp_ok) {
+      Result<ImageData> result;
+      result.success = false;
+      result.errors.push_back(ErrorInfo(ErrorCode::CompressionError,
+                                        "Failed to decompress block " + std::to_string(block),
+                                        reader.context(), reader.tell()));
+      return result;
+    }
+
+    // Convert pixel data to RGBA float
+    for (int line = 0; line < num_lines; line++) {
+      int y = y_start + line;
+      if (y < 0 || y >= height) continue;
+
+      const uint8_t* line_data = decomp_buf.data() + static_cast<size_t>(line) * pixel_data_size;
+      float* out_line = img_data.rgba.data() + static_cast<size_t>(y) * static_cast<size_t>(width) * 4;
+
+      for (int x = 0; x < width; x++) {
+        const uint8_t* pixel = line_data + static_cast<size_t>(x) * bytes_per_pixel;
+
+        // Process each channel
+        for (size_t c = 0; c < hdr.channels.size(); c++) {
+          int out_idx = channel_output_idx[c];
+          if (out_idx < 0 || out_idx > 3) continue;
+
+          const uint8_t* ch_data = pixel + channel_offsets[c];
+          float val = 0.0f;
+
+          switch (hdr.channels[c].pixel_type) {
+            case PIXEL_TYPE_UINT: {
+              uint32_t u;
+              std::memcpy(&u, ch_data, 4);
+              val = static_cast<float>(u) / 4294967295.0f;  // Normalize to [0,1]
+              break;
+            }
+            case PIXEL_TYPE_HALF: {
+              uint16_t h;
+              std::memcpy(&h, ch_data, 2);
+              val = HalfToFloat(h);
+              break;
+            }
+            case PIXEL_TYPE_FLOAT: {
+              std::memcpy(&val, ch_data, 4);
+              break;
+            }
+          }
+
+          out_line[x * 4 + out_idx] = val;
+        }
+
+        // Set alpha to 1.0 if not present
+        bool has_alpha = false;
+        for (size_t c = 0; c < hdr.channels.size(); c++) {
+          if (channel_output_idx[c] == 3) {
+            has_alpha = true;
+            break;
+          }
+        }
+        if (!has_alpha) {
+          out_line[x * 4 + 3] = 1.0f;
+        }
+      }
+    }
+
+    reader.seek_relative(static_cast<int64_t>(data_size));
+  }
 
   Result<ImageData> result = Result<ImageData>::ok(img_data);
 
@@ -417,8 +1020,6 @@ Result<ImageData> LoadFromMemory(const uint8_t* data, size_t size) {
   for (size_t i = 0; i < header_result.warnings.size(); i++) {
     result.warnings.push_back(header_result.warnings[i]);
   }
-
-  result.add_warning("Image pixel data loading not yet implemented in v2 API");
 
   return result;
 }
