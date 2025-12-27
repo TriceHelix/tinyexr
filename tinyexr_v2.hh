@@ -701,16 +701,21 @@ struct Header {
   int tile_level_mode;
   int tile_rounding_mode;
 
-  // Multipart
-  std::string name;
-  std::string type;
+  // Multipart / Deep
+  std::string name;           // Part name (required for multipart)
+  std::string type;           // "scanlineimage", "tiledimage", "deepscanline", "deeptile"
+  std::string view;           // View name for stereo (e.g., "left", "right")
+  int chunk_count;            // Number of chunks (for multipart files)
+  int deep_data_version;      // Version of deep data format (1 = current)
+  bool is_deep;               // True if this is a deep image part
 
   size_t header_len;  // Length of header in bytes
 
   Header()
     : compression(0), line_order(0), pixel_aspect_ratio(1.0f),
       screen_window_width(1.0f), tiled(false), tile_size_x(0), tile_size_y(0),
-      tile_level_mode(0), tile_rounding_mode(0), header_len(0) {
+      tile_level_mode(0), tile_rounding_mode(0), chunk_count(0),
+      deep_data_version(0), is_deep(false), header_len(0) {
     screen_window_center[0] = 0.0f;
     screen_window_center[1] = 0.0f;
   }
@@ -737,7 +742,53 @@ struct ImageData {
   ImageData() : width(0), height(0), num_channels(0) {}
 };
 
+// Deep image data - variable samples per pixel
+struct DeepImageData {
+  int width;
+  int height;
+  int num_channels;
+  Header header;
+
+  // Sample counts per pixel (width * height elements)
+  std::vector<uint32_t> sample_counts;
+
+  // Total number of samples across all pixels
+  size_t total_samples;
+
+  // Per-channel deep data (flattened, total_samples elements each)
+  // channel_data[channel_index][sample_index] = sample value
+  std::vector<std::vector<float>> channel_data;
+
+  DeepImageData() : width(0), height(0), num_channels(0), total_samples(0) {}
+};
+
+// Multipart image data - multiple parts/layers
+struct MultipartImageData {
+  std::vector<ImageData> parts;          // Regular image parts
+  std::vector<DeepImageData> deep_parts; // Deep image parts
+  std::vector<Header> headers;           // All part headers
+
+  // Get part by name
+  const ImageData* get_part(const std::string& name) const {
+    for (size_t i = 0; i < parts.size(); i++) {
+      if (parts[i].header.name == name) return &parts[i];
+    }
+    return nullptr;
+  }
+
+  // Get part by view name (for stereo)
+  const ImageData* get_view(const std::string& view) const {
+    for (size_t i = 0; i < parts.size(); i++) {
+      if (parts[i].header.view == view) return &parts[i];
+    }
+    return nullptr;
+  }
+};
+
 Result<ImageData> LoadFromMemory(const uint8_t* data, size_t size);
+
+// Load multipart/deep EXR from memory
+Result<MultipartImageData> LoadMultipartFromMemory(const uint8_t* data, size_t size);
 
 // ============================================================================
 // Writer functions
@@ -750,7 +801,20 @@ Result<void> WriteVersion(Writer& writer, const Version& version);
 Result<void> WriteHeader(Writer& writer, const Header& header);
 
 // Save image data to memory (simplified API)
+// compression_level: 1-9 for ZIP compression (6 = default)
+Result<std::vector<uint8_t>> SaveToMemory(const ImageData& image, int compression_level);
 Result<std::vector<uint8_t>> SaveToMemory(const ImageData& image);
+
+// Save image data to file
+Result<void> SaveToFile(const char* filename, const ImageData& image, int compression_level = 6);
+
+// Save multipart image data to memory
+// compression_level: 1-9 for ZIP compression (6 = default)
+Result<std::vector<uint8_t>> SaveMultipartToMemory(const MultipartImageData& multipart, int compression_level);
+Result<std::vector<uint8_t>> SaveMultipartToMemory(const MultipartImageData& multipart);
+
+// Save multipart image data to file
+Result<void> SaveMultipartToFile(const char* filename, const MultipartImageData& multipart, int compression_level = 6);
 
 // ============================================================================
 // Pixel Processing Utilities (with SIMD optimization when enabled)

@@ -1179,14 +1179,22 @@ inline tinyexr::v2::Result<void> DecompressPizV2(
   }
   size_t tmpBufSize = dstSize / sizeof(uint16_t);
 
-  // Validate expected size against channel parameters
+  // Validate expected size against channel parameters (accounting for subsampling)
   size_t expectedSize = 0;
   for (int i = 0; i < numChannels; ++i) {
     size_t pixelSize = sizeof(int);  // UINT and FLOAT
     if (channels[i].pixel_type == 1) {  // HALF
       pixelSize = sizeof(short);
     }
-    size_t channelBytes = static_cast<size_t>(dataWidth) * numLines * pixelSize;
+    // Account for subsampling
+    int x_samp = channels[i].x_sampling > 0 ? channels[i].x_sampling : 1;
+    int y_samp = channels[i].y_sampling > 0 ? channels[i].y_sampling : 1;
+    int channelWidth = dataWidth / x_samp;
+    int channelHeight = numLines / y_samp;
+    // For partial blocks, add extra line/column if there's a remainder
+    if ((numLines % y_samp) != 0) channelHeight++;
+    if ((dataWidth % x_samp) != 0) channelWidth++;
+    size_t channelBytes = static_cast<size_t>(channelWidth) * channelHeight * pixelSize;
     // Check for overflow
     if (expectedSize > SIZE_MAX - channelBytes) {
       return Result<void>::error(ErrorInfo(
@@ -1246,10 +1254,19 @@ inline tinyexr::v2::Result<void> DecompressPizV2(
       pixelSize = sizeof(short);
     }
 
+    // Account for subsampling
+    int x_samp = chan.x_sampling > 0 ? chan.x_sampling : 1;
+    int y_samp = chan.y_sampling > 0 ? chan.y_sampling : 1;
+    int channelWidth = dataWidth / x_samp;
+    int channelHeight = numLines / y_samp;
+    // For partial blocks, add extra line/column if there's a remainder
+    if ((numLines % y_samp) != 0) channelHeight++;
+    if ((dataWidth % x_samp) != 0) channelWidth++;
+
     channelData[i].start = tmpBufferEnd;
     channelData[i].end = channelData[i].start;
-    channelData[i].nx = dataWidth;
-    channelData[i].ny = numLines;
+    channelData[i].nx = channelWidth;
+    channelData[i].ny = channelHeight;
     channelData[i].size = static_cast<int>(pixelSize / sizeof(short));
 
     size_t channelElements = static_cast<size_t>(channelData[i].nx) *
@@ -1296,13 +1313,21 @@ inline tinyexr::v2::Result<void> DecompressPizV2(
     ));
   }
 
-  // Copy data to output, interleaving channels
+  // Copy data to output, interleaving channels (accounting for subsampling)
   uint8_t* outPtr = dst;
   uint8_t* outLimit = dst + dstSize;
 
   for (int y = 0; y < numLines; y++) {
     for (size_t i = 0; i < numChan; ++i) {
+      const Channel& chan = channels[i];
       PIZChannelData& cd = channelData[i];
+
+      // For subsampled channels, only output on sampled lines
+      int y_samp = chan.y_sampling > 0 ? chan.y_sampling : 1;
+      if ((y % y_samp) != 0) {
+        continue;  // This line doesn't have data for this channel
+      }
+
       size_t n = static_cast<size_t>(cd.nx * cd.size);
       size_t copyBytes = n * sizeof(uint16_t);
 
