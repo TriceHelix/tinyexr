@@ -10,6 +10,7 @@
 #include "tinyexr_v2.hh"
 #include <cstring>
 #include <cstdio>
+#include <cmath>
 #include <algorithm>
 
 // Include compression library
@@ -340,9 +341,31 @@ static bool DecompressPxr24V2(uint8_t* dst, size_t expected_size,
   std::vector<uint8_t> pxr24_buf(pxr24_size);
   size_t uncomp_size = pxr24_size;
 
-  // Decompress with zlib
-  if (!DecompressZipV2(pxr24_buf.data(), &uncomp_size, src, src_size, pool)) {
+  // Note: PXR24 uses raw zlib compression without predictor/reorder
+  // So we use direct zlib decompression instead of DecompressZipV2
+  // (which applies predictor and reorder for standard ZIP format)
+  if (pxr24_size == src_size) {
+    // Uncompressed - copy directly
+    std::memcpy(pxr24_buf.data(), src, src_size);
+  } else {
+#if TINYEXR_USE_MINIZ
+    mz_ulong dest_len = static_cast<mz_ulong>(pxr24_size);
+    int ret = mz_uncompress(pxr24_buf.data(), &dest_len, src, static_cast<mz_ulong>(src_size));
+    if (ret != MZ_OK) {
+      return false;
+    }
+    uncomp_size = static_cast<size_t>(dest_len);
+#elif TINYEXR_USE_ZLIB
+    uLongf dest_len = static_cast<uLongf>(pxr24_size);
+    int ret = uncompress(pxr24_buf.data(), &dest_len, src, static_cast<uLong>(src_size));
+    if (ret != Z_OK) {
+      return false;
+    }
+    uncomp_size = static_cast<size_t>(dest_len);
+#else
+    (void)pool;
     return false;
+#endif
   }
 
   if (uncomp_size != pxr24_size) {
@@ -406,7 +429,6 @@ static bool DecompressPxr24V2(uint8_t* dst, size_t expected_size,
 
   return true;
 }
-
 // ============================================================================
 // B44/B44A decompression
 // ============================================================================
@@ -414,36 +436,110 @@ static bool DecompressPxr24V2(uint8_t* dst, size_t expected_size,
 // B44 compresses 4x4 blocks of HALF values to 14 bytes
 // B44A is similar but can compress flat regions to 3 bytes
 
-// Unpack one 4x4 block from B44 compressed data
-static void UnpackB44Block(uint16_t dst[16], const uint8_t src[14]) {
-  // B44 packs 16 half values into 14 bytes
-  // Based on OpenEXR's b44ExpTable lookup
+// B44 Exp/Log Tables
+// These tables convert between half-float and a 14-bit logarithmic representation
+// where small integer differences correspond to small floating-point differences.
+// This makes 6-bit delta encoding effective for typical image data.
 
-  // The first 3 bytes encode the DC coefficient (base value)
-  // Remaining 11 bytes encode the AC coefficients (differences)
+// Half-float to 14-bit log table (generated at runtime, cached)
+static uint16_t g_b44_exp_table[65536];
+// 14-bit log to half-float table
+static uint16_t g_b44_log_table[16384];
+static bool g_b44_tables_initialized = false;
 
-  // Simplified implementation: unpack as raw half values
-  // Note: This is a simplified version - full B44 uses a more complex
-  // lookup table approach. For maximum compatibility, we decompress
-  // what we can and let PIZ/ZIP fallback handle complex cases.
+// Initialize B44 exp/log lookup tables
+// Uses linear magnitude mapping: 15-bit magnitude -> 13-bit log per sign half
+// This ensures proper range fitting and preserves sign information.
+static void InitB44Tables() {
+  if (g_b44_tables_initialized) return;
 
-  // Read 14 bytes as packed data
-  // Format: 6 bits per coefficient difference after first value
+  // Generate expTable: half-float -> 14-bit log
+  // Log space: 0-8191 for negative, 8192-16383 for positive
+  // 15-bit magnitude (0-32767) maps to 13-bit range (0-8191) per half
+  for (int i = 0; i < 65536; i++) {
+    uint16_t h = static_cast<uint16_t>(i);
 
-  uint16_t base = (static_cast<uint16_t>(src[0]) << 8) | src[1];
+    if ((h & 0x7FFF) == 0) {
+      // +0 or -0 -> center point
+      g_b44_exp_table[i] = (h & 0x8000) ? 8191 : 8192;
+    } else if ((h & 0x7C00) == 0x7C00) {
+      // Inf or NaN - clamp to max/min
+      g_b44_exp_table[i] = (h & 0x8000) ? 0 : 16383;
+    } else {
+      // Normal or denormal
+      uint16_t magnitude = h & 0x7FFF;  // 15-bit magnitude (0-32767)
 
-  // For now, fill with base value (this handles flat regions well)
-  // Full implementation would decode the 6-bit deltas
-  for (int i = 0; i < 16; i++) {
-    dst[i] = base;
+      // Map 15-bit magnitude to 13-bit range (0-8191) using >> 2
+      uint16_t log_offset = magnitude >> 2;  // Now 0-8191
+
+      if (h & 0x8000) {
+        // Negative: map to 0-8191 (lower half, reversed)
+        // Larger magnitude = smaller log value
+        int log_val = 8191 - static_cast<int>(log_offset);
+        if (log_val < 0) log_val = 0;
+        g_b44_exp_table[i] = static_cast<uint16_t>(log_val);
+      } else {
+        // Positive: map to 8192-16383 (upper half)
+        int log_val = 8192 + static_cast<int>(log_offset);
+        if (log_val > 16383) log_val = 16383;
+        g_b44_exp_table[i] = static_cast<uint16_t>(log_val);
+      }
+    }
   }
 
-  // Decode the differences from remaining 12 bytes
-  // Each subsequent value is base + 6-bit signed delta
+  // Generate logTable: 14-bit log -> half-float (inverse of above)
+  for (int i = 0; i < 16384; i++) {
+    if (i == 8192) {
+      g_b44_log_table[i] = 0x0000;  // +0
+    } else if (i == 8191) {
+      g_b44_log_table[i] = 0x8000;  // -0
+    } else if (i > 8192) {
+      // Positive: log range 8193-16383 -> magnitude
+      uint16_t log_offset = static_cast<uint16_t>(i - 8192);  // 1-8191
+      uint16_t magnitude = log_offset << 2;  // Reverse the >> 2
+      if (magnitude > 0x7BFF) magnitude = 0x7BFF;  // Clamp below inf
+      g_b44_log_table[i] = magnitude;
+    } else {
+      // Negative: log range 0-8190 -> magnitude
+      uint16_t log_offset = static_cast<uint16_t>(8191 - i);  // 1-8191
+      uint16_t magnitude = log_offset << 2;
+      if (magnitude > 0x7BFF) magnitude = 0x7BFF;
+      g_b44_log_table[i] = 0x8000 | magnitude;
+    }
+  }
+
+  g_b44_tables_initialized = true;
+}
+
+// Convert half-float to 14-bit log value
+static inline uint16_t HalfToLog(uint16_t h) {
+  return g_b44_exp_table[h];
+}
+
+// Convert 14-bit log value to half-float
+static inline uint16_t LogToHalf(uint16_t log_val) {
+  return g_b44_log_table[log_val & 0x3FFF];
+}
+
+// Unpack one 4x4 block from B44 compressed data
+static void UnpackB44Block(uint16_t dst[16], const uint8_t src[14]) {
+  // B44 packs 16 half values into 14 bytes using log-space delta encoding
+  // Format: 2 bytes base (14-bit log) + 12 bytes for 15 6-bit deltas (90 bits)
+
+  InitB44Tables();
+
+  // Read 14-bit base value (big-endian, packed into 2 bytes)
+  uint16_t base_log = (static_cast<uint16_t>(src[0]) << 8) | src[1];
+  base_log &= 0x3FFF;  // 14-bit mask
+
+  // First pixel uses base directly
+  dst[0] = LogToHalf(base_log);
+
+  // Decode the 15 6-bit deltas from remaining 12 bytes
   const uint8_t* delta_ptr = src + 2;
   int bit_pos = 0;
 
-  for (int i = 1; i < 16 && (bit_pos / 8) < 12; i++) {
+  for (int i = 1; i < 16; i++) {
     int byte_idx = bit_pos / 8;
     int bit_offset = bit_pos % 8;
 
@@ -458,11 +554,13 @@ static void UnpackB44Block(uint16_t dst[16], const uint8_t src[14]) {
     // Convert 6-bit unsigned to signed delta (-31 to +32)
     int delta = static_cast<int>(bits) - 31;
 
-    // Apply delta to base
-    int result = static_cast<int>(base) + delta;
-    if (result < 0) result = 0;
-    if (result > 0xFFFF) result = 0xFFFF;
-    dst[i] = static_cast<uint16_t>(result);
+    // Apply delta in log space
+    int result_log = static_cast<int>(base_log) + delta;
+    if (result_log < 0) result_log = 0;
+    if (result_log > 16383) result_log = 16383;
+
+    // Convert back to half-float
+    dst[i] = LogToHalf(static_cast<uint16_t>(result_log));
 
     bit_pos += 6;
   }
@@ -473,27 +571,60 @@ static bool DecompressB44V2(uint8_t* dst, size_t expected_size,
                             int width, int num_lines,
                             int num_channels, const Channel* channels,
                             bool is_b44a, ScratchPool& pool) {
+  (void)pool;
+
   // B44 only works with HALF pixel types
   // Each 4x4 block of HALF values compresses to:
   // - 14 bytes for regular blocks
   // - 3 bytes for flat blocks (B44A only)
 
+  // Output layout: per-scanline interleaved
+  // [Scanline0: Ch0_pixels | Ch1_pixels | ...][Scanline1: ...]
+
   const uint8_t* in_ptr = src;
   const uint8_t* in_end = src + src_size;
-  uint8_t* out_ptr = dst;
 
+  // Calculate bytes per scanline for output layout
+  size_t bytes_per_scanline = 0;
+  for (int c = 0; c < num_channels; c++) {
+    int ch_width = width / channels[c].x_sampling;
+    bytes_per_scanline += static_cast<size_t>(ch_width) *
+                          ((channels[c].pixel_type == PIXEL_TYPE_FLOAT) ? 4 :
+                           (channels[c].pixel_type == PIXEL_TYPE_UINT) ? 4 : 2);
+  }
+
+  // Initialize output buffer
+  std::memset(dst, 0, expected_size);
+
+  // Process each channel
   for (int c = 0; c < num_channels; c++) {
     int ch_width = width / channels[c].x_sampling;
     int ch_height = num_lines / channels[c].y_sampling;
+
+    // Calculate channel offset within each scanline
+    size_t ch_offset = 0;
+    for (int i = 0; i < c; i++) {
+      int ch_w = width / channels[i].x_sampling;
+      ch_offset += static_cast<size_t>(ch_w) *
+                   ((channels[i].pixel_type == PIXEL_TYPE_FLOAT) ? 4 :
+                    (channels[i].pixel_type == PIXEL_TYPE_UINT) ? 4 : 2);
+    }
 
     if (channels[c].pixel_type != PIXEL_TYPE_HALF) {
       // Non-HALF channels are stored uncompressed
       size_t ch_size = static_cast<size_t>(ch_width) * ch_height *
                        (channels[c].pixel_type == PIXEL_TYPE_FLOAT ? 4 : 4);
       if (in_ptr + ch_size > in_end) return false;
-      std::memcpy(out_ptr, in_ptr, ch_size);
-      in_ptr += ch_size;
-      out_ptr += ch_size;
+
+      // Copy to per-scanline layout
+      size_t pixel_size = (channels[c].pixel_type == PIXEL_TYPE_FLOAT) ? 4 : 4;
+      for (int line = 0; line < num_lines; line++) {
+        if ((line % channels[c].y_sampling) != 0) continue;
+
+        uint8_t* line_ptr = dst + static_cast<size_t>(line) * bytes_per_scanline + ch_offset;
+        std::memcpy(line_ptr, in_ptr, static_cast<size_t>(ch_width) * pixel_size);
+        in_ptr += static_cast<size_t>(ch_width) * pixel_size;
+      }
       continue;
     }
 
@@ -501,6 +632,7 @@ static bool DecompressB44V2(uint8_t* dst, size_t expected_size,
     int num_blocks_x = (ch_width + 3) / 4;
     int num_blocks_y = (ch_height + 3) / 4;
 
+    // Decompress into temporary channel buffer
     std::vector<uint16_t> ch_data(static_cast<size_t>(ch_width) * ch_height);
 
     for (int by = 0; by < num_blocks_y; by++) {
@@ -529,7 +661,7 @@ static bool DecompressB44V2(uint8_t* dst, size_t expected_size,
           return false;
         }
 
-        // Copy block to output (with bounds checking for edge blocks)
+        // Copy block to temp buffer (with bounds checking for edge blocks)
         for (int py = 0; py < 4; py++) {
           int y = by * 4 + py;
           if (y >= ch_height) break;
@@ -544,10 +676,188 @@ static bool DecompressB44V2(uint8_t* dst, size_t expected_size,
       }
     }
 
-    // Copy channel data to output
-    size_t ch_bytes = static_cast<size_t>(ch_width) * ch_height * 2;
-    std::memcpy(out_ptr, ch_data.data(), ch_bytes);
-    out_ptr += ch_bytes;
+    // Copy channel data to output in per-scanline layout
+    for (int line = 0; line < num_lines; line++) {
+      if ((line % channels[c].y_sampling) != 0) continue;
+
+      int ch_line = line / channels[c].y_sampling;
+      uint8_t* line_ptr = dst + static_cast<size_t>(line) * bytes_per_scanline + ch_offset;
+
+      for (int x = 0; x < ch_width; x++) {
+        uint16_t val = ch_data[ch_line * ch_width + x];
+        line_ptr[x * 2] = static_cast<uint8_t>(val & 0xFF);
+        line_ptr[x * 2 + 1] = static_cast<uint8_t>(val >> 8);
+      }
+    }
+  }
+
+  return true;
+}
+
+// Pack 16 half values into a 14-byte B44 block using log-space encoding
+static void PackB44Block(uint8_t dst[14], const uint16_t src[16]) {
+  // B44 format:
+  // - 2 bytes: base value in log-space (big-endian, 14-bit)
+  // - 12 bytes: 15 6-bit deltas (90 bits packed) in log-space
+
+  InitB44Tables();
+
+  // Convert first value to log space and use as base
+  uint16_t base_log = HalfToLog(src[0]);
+  dst[0] = static_cast<uint8_t>(base_log >> 8);
+  dst[1] = static_cast<uint8_t>(base_log & 0xFF);
+
+  // Initialize delta bytes to zero
+  for (int i = 2; i < 14; i++) {
+    dst[i] = 0;
+  }
+
+  // Pack 15 6-bit deltas in log space
+  uint8_t* delta_ptr = dst + 2;
+  int bit_pos = 0;
+
+  for (int i = 1; i < 16; i++) {
+    // Calculate delta in log space (clamped to 6-bit range: -31 to +32)
+    uint16_t val_log = HalfToLog(src[i]);
+    int delta = static_cast<int>(val_log) - static_cast<int>(base_log);
+
+    // Clamp to representable range
+    if (delta < -31) delta = -31;
+    if (delta > 32) delta = 32;
+
+    // Convert signed delta to unsigned 6-bit value (bias by 31)
+    uint32_t bits = static_cast<uint32_t>(delta + 31) & 0x3F;
+
+    // Write 6 bits at current bit position
+    int byte_idx = bit_pos / 8;
+    int bit_offset = bit_pos % 8;
+
+    delta_ptr[byte_idx] |= static_cast<uint8_t>(bits << bit_offset);
+    if (bit_offset > 2 && byte_idx + 1 < 12) {
+      // Bits overflow into next byte
+      delta_ptr[byte_idx + 1] |= static_cast<uint8_t>(bits >> (8 - bit_offset));
+    }
+
+    bit_pos += 6;
+  }
+}
+
+// Check if a 4x4 block has all identical values (for B44A optimization)
+static bool IsB44FlatBlock(const uint16_t src[16]) {
+  uint16_t val = src[0];
+  for (int i = 1; i < 16; i++) {
+    if (src[i] != val) return false;
+  }
+  return true;
+}
+
+// Compress data using B44/B44A algorithm
+static bool CompressB44V2(const uint8_t* src, size_t src_size,
+                          std::vector<uint8_t>& dst,
+                          int width, int num_lines,
+                          int num_channels, const Channel* channels,
+                          bool is_b44a) {
+  (void)src_size;  // Not needed - we calculate from layout
+
+  // B44 only works with HALF pixel types
+  // Each 4x4 block of HALF values compresses to:
+  // - 14 bytes for regular blocks
+  // - 3 bytes for flat blocks (B44A only)
+
+  // Input data layout (from SaveToMemory):
+  // For each scanline: [Ch0_x0..Ch0_xN][Ch1_x0..Ch1_xN]...[ChM_x0..ChM_xN]
+  // All channels are HALF (2 bytes each)
+
+  // Calculate bytes per scanline (all channels)
+  size_t bytes_per_pixel = 0;
+  for (int c = 0; c < num_channels; c++) {
+    bytes_per_pixel += (channels[c].pixel_type == PIXEL_TYPE_FLOAT) ? 4 :
+                       (channels[c].pixel_type == PIXEL_TYPE_UINT) ? 4 : 2;
+  }
+  size_t bytes_per_scanline = bytes_per_pixel * static_cast<size_t>(width);
+
+  // Reserve estimated output size
+  dst.clear();
+  dst.reserve(src_size);
+
+  // Process each channel
+  for (int c = 0; c < num_channels; c++) {
+    int ch_width = width / channels[c].x_sampling;
+    int ch_height = num_lines / channels[c].y_sampling;
+
+    // Calculate channel offset within each scanline
+    size_t ch_offset = 0;
+    for (int i = 0; i < c; i++) {
+      int ch_w = width / channels[i].x_sampling;
+      ch_offset += static_cast<size_t>(ch_w) *
+                   ((channels[i].pixel_type == PIXEL_TYPE_FLOAT) ? 4 :
+                    (channels[i].pixel_type == PIXEL_TYPE_UINT) ? 4 : 2);
+    }
+
+    if (channels[c].pixel_type != PIXEL_TYPE_HALF) {
+      // Non-HALF channels: copy uncompressed from per-scanline layout
+      for (int line = 0; line < num_lines; line++) {
+        if ((line % channels[c].y_sampling) != 0) continue;
+
+        const uint8_t* line_data = src + static_cast<size_t>(line) * bytes_per_scanline + ch_offset;
+        size_t ch_line_bytes = static_cast<size_t>(ch_width) *
+                               ((channels[c].pixel_type == PIXEL_TYPE_FLOAT) ? 4 : 4);
+        dst.insert(dst.end(), line_data, line_data + ch_line_bytes);
+      }
+      continue;
+    }
+
+    // Extract channel data from per-scanline layout into contiguous buffer
+    std::vector<uint16_t> ch_data(static_cast<size_t>(ch_width) * ch_height);
+    for (int line = 0; line < num_lines; line++) {
+      if ((line % channels[c].y_sampling) != 0) continue;
+
+      int ch_line = line / channels[c].y_sampling;
+      const uint8_t* line_ptr = src + static_cast<size_t>(line) * bytes_per_scanline + ch_offset;
+
+      for (int x = 0; x < ch_width; x++) {
+        // Data is stored little-endian
+        uint16_t val = static_cast<uint16_t>(line_ptr[x * 2]) |
+                       (static_cast<uint16_t>(line_ptr[x * 2 + 1]) << 8);
+        ch_data[ch_line * ch_width + x] = val;
+      }
+    }
+
+    // Process HALF channel in 4x4 blocks
+    int num_blocks_x = (ch_width + 3) / 4;
+    int num_blocks_y = (ch_height + 3) / 4;
+
+    for (int by = 0; by < num_blocks_y; by++) {
+      for (int bx = 0; bx < num_blocks_x; bx++) {
+        uint16_t block[16];
+
+        // Extract 4x4 block (with padding for edge blocks)
+        for (int py = 0; py < 4; py++) {
+          int y = by * 4 + py;
+          if (y >= ch_height) y = ch_height - 1;  // Clamp to edge
+
+          for (int px = 0; px < 4; px++) {
+            int x = bx * 4 + px;
+            if (x >= ch_width) x = ch_width - 1;  // Clamp to edge
+
+            block[py * 4 + px] = ch_data[y * ch_width + x];
+          }
+        }
+
+        // Check for flat block optimization (B44A only)
+        if (is_b44a && IsB44FlatBlock(block)) {
+          // Write 3-byte flat block: 0x80 flag + 2 bytes value
+          dst.push_back(0x80);
+          dst.push_back(static_cast<uint8_t>(block[0] >> 8));
+          dst.push_back(static_cast<uint8_t>(block[0] & 0xFF));
+        } else {
+          // Write 14-byte regular block
+          uint8_t packed[14];
+          PackB44Block(packed, block);
+          dst.insert(dst.end(), packed, packed + 14);
+        }
+      }
+    }
   }
 
   return true;
@@ -957,6 +1267,16 @@ Result<Header> ParseHeader(Reader& reader, const Version& version) {
         }
         ch.pixel_type = static_cast<int>(pixel_type);
 
+        // Validate pixel type (0=UINT, 1=HALF, 2=FLOAT)
+        if (ch.pixel_type > 2) {
+          return Result<Header>::error(
+            ErrorInfo(ErrorCode::InvalidData,
+                      "Invalid pixel type " + std::to_string(ch.pixel_type) +
+                      " for channel '" + channel_name + "' (must be 0, 1, or 2)",
+                      reader.context(),
+                      reader.tell()));
+        }
+
         // Read pLinear (1 byte) + reserved (3 bytes)
         uint8_t plinear;
         if (!reader.read1(&plinear)) {
@@ -983,6 +1303,17 @@ Result<Header> ParseHeader(Reader& reader, const Version& version) {
           return Result<Header>::error(reader.last_error());
         }
         ch.y_sampling = static_cast<int>(y_sampling);
+
+        // Validate sampling factors (must be positive)
+        if (ch.x_sampling <= 0 || ch.y_sampling <= 0) {
+          return Result<Header>::error(
+            ErrorInfo(ErrorCode::InvalidData,
+                      "Invalid sampling factor for channel '" + channel_name +
+                      "' (x=" + std::to_string(ch.x_sampling) +
+                      ", y=" + std::to_string(ch.y_sampling) + "); must be > 0",
+                      reader.context(),
+                      reader.tell()));
+        }
 
         header.channels.push_back(ch);
       }
@@ -1030,6 +1361,16 @@ Result<Header> ParseHeader(Reader& reader, const Version& version) {
       header.data_window.min_y = static_cast<int>(vals[1]);
       header.data_window.max_x = static_cast<int>(vals[2]);
       header.data_window.max_y = static_cast<int>(vals[3]);
+
+      // Validate data window bounds (min must be <= max)
+      if (header.data_window.min_x > header.data_window.max_x ||
+          header.data_window.min_y > header.data_window.max_y) {
+        return Result<Header>::error(
+          ErrorInfo(ErrorCode::InvalidData,
+                    "Invalid dataWindow: min > max",
+                    reader.context(),
+                    data_start));
+      }
     }
     else if (attr_name == "displayWindow" && attr_type == "box2i") {
       has_display_window = true;
@@ -1050,6 +1391,16 @@ Result<Header> ParseHeader(Reader& reader, const Version& version) {
       header.display_window.min_y = static_cast<int>(vals[1]);
       header.display_window.max_x = static_cast<int>(vals[2]);
       header.display_window.max_y = static_cast<int>(vals[3]);
+
+      // Validate display window bounds (min must be <= max)
+      if (header.display_window.min_x > header.display_window.max_x ||
+          header.display_window.min_y > header.display_window.max_y) {
+        return Result<Header>::error(
+          ErrorInfo(ErrorCode::InvalidData,
+                    "Invalid displayWindow: min > max",
+                    reader.context(),
+                    data_start));
+      }
     }
     else if (attr_name == "lineOrder" && attr_type == "lineOrder") {
       has_line_order = true;
@@ -1065,6 +1416,16 @@ Result<Header> ParseHeader(Reader& reader, const Version& version) {
         return Result<Header>::error(reader.last_error());
       }
       header.line_order = lo;
+
+      // Validate line order (0=INCREASING_Y, 1=DECREASING_Y, 2=RANDOM_Y for tiled)
+      if (header.line_order > 2) {
+        return Result<Header>::error(
+          ErrorInfo(ErrorCode::InvalidData,
+                    "Invalid lineOrder value " + std::to_string(header.line_order) +
+                    " (must be 0, 1, or 2)",
+                    reader.context(),
+                    data_start));
+      }
     }
     else if (attr_name == "pixelAspectRatio" && attr_type == "float") {
       has_pixel_aspect_ratio = true;
@@ -1080,6 +1441,16 @@ Result<Header> ParseHeader(Reader& reader, const Version& version) {
         return Result<Header>::error(reader.last_error());
       }
       std::memcpy(&header.pixel_aspect_ratio, &bits, 4);
+
+      // Validate pixel aspect ratio (must be positive and finite)
+      if (header.pixel_aspect_ratio <= 0.0f ||
+          !std::isfinite(header.pixel_aspect_ratio)) {
+        return Result<Header>::error(
+          ErrorInfo(ErrorCode::InvalidData,
+                    "Invalid pixelAspectRatio (must be positive and finite)",
+                    reader.context(),
+                    data_start));
+      }
     }
     else if (attr_name == "screenWindowCenter" && attr_type == "v2f") {
       has_screen_window_center = true;
@@ -2645,6 +3016,84 @@ static bool CompressZip(const uint8_t* src, size_t src_size,
   return false;
 #endif
 }
+
+// PXR24 compression
+// Reverse of DecompressPxr24V2: convert FLOAT to 24-bit, then ZIP compress
+static bool CompressPxr24V2(const uint8_t* src, size_t src_size,
+                            int width, int num_lines,
+                            int num_channels, const Channel* channels,
+                            std::vector<uint8_t>& dst,
+                            int compression_level = 6) {
+  (void)src_size;  // Not needed - we calculate from channel layout
+
+  // Calculate PXR24 data size (UINT: 4 bytes, HALF: 2 bytes, FLOAT: 3 bytes)
+  size_t pxr24_size = 0;
+  for (int c = 0; c < num_channels; c++) {
+    int ch_width = width / channels[c].x_sampling;
+    int ch_height = num_lines / channels[c].y_sampling;
+    int ch_pixels = ch_width * ch_height;
+
+    switch (channels[c].pixel_type) {
+      case PIXEL_TYPE_UINT:  pxr24_size += static_cast<size_t>(ch_pixels) * 4; break;
+      case PIXEL_TYPE_HALF:  pxr24_size += static_cast<size_t>(ch_pixels) * 2; break;
+      case PIXEL_TYPE_FLOAT: pxr24_size += static_cast<size_t>(ch_pixels) * 3; break;
+    }
+  }
+
+  // Allocate buffer for PXR24 format data
+  std::vector<uint8_t> pxr24_buf(pxr24_size);
+  const uint8_t* in_ptr = src;
+  uint8_t* out_ptr = pxr24_buf.data();
+
+  // Convert standard EXR format to PXR24 format
+  // Data is organized by scanline, then by channel
+  for (int line = 0; line < num_lines; line++) {
+    for (int c = 0; c < num_channels; c++) {
+      int ch_width = width / channels[c].x_sampling;
+
+      // Check if this line contains data for this channel (accounting for y_sampling)
+      if ((line % channels[c].y_sampling) != 0) continue;
+
+      switch (channels[c].pixel_type) {
+        case PIXEL_TYPE_UINT:
+          // UINT stored as 4 bytes, copy directly
+          for (int x = 0; x < ch_width; x++) {
+            std::memcpy(out_ptr, in_ptr, 4);
+            in_ptr += 4;
+            out_ptr += 4;
+          }
+          break;
+
+        case PIXEL_TYPE_HALF:
+          // HALF stored as 2 bytes, copy directly
+          for (int x = 0; x < ch_width; x++) {
+            std::memcpy(out_ptr, in_ptr, 2);
+            in_ptr += 2;
+            out_ptr += 2;
+          }
+          break;
+
+        case PIXEL_TYPE_FLOAT:
+          // FLOAT stored as 24-bit (3 bytes): truncate lower 8 mantissa bits
+          for (int x = 0; x < ch_width; x++) {
+            uint32_t val;
+            std::memcpy(&val, in_ptr, 4);
+            // Extract upper 24 bits (1 sign + 8 exponent + 15 mantissa)
+            out_ptr[0] = static_cast<uint8_t>(val >> 24);
+            out_ptr[1] = static_cast<uint8_t>(val >> 16);
+            out_ptr[2] = static_cast<uint8_t>(val >> 8);
+            // Lower 8 mantissa bits are discarded
+            in_ptr += 4;
+            out_ptr += 3;
+          }
+          break;
+      }
+    }
+  }
+
+  // Now ZIP compress the PXR24 data
+  return CompressZip(pxr24_buf.data(), pxr24_size, dst, compression_level);
+}
 #endif
 
 Result<std::vector<uint8_t>> SaveToMemory(const ImageData& image, int compression_level) {
@@ -2691,8 +3140,15 @@ Result<std::vector<uint8_t>> SaveToMemory(const ImageData& image, int compressio
     return result;
   }
 
+  // Create a modified header for writing - since we always write HALF data,
+  // the header must reflect HALF pixel_type for all channels
+  Header write_header = header;
+  for (auto& ch : write_header.channels) {
+    ch.pixel_type = PIXEL_TYPE_HALF;
+  }
+
   // Write header
-  Result<void> header_result = WriteHeader(writer, header);
+  Result<void> header_result = WriteHeader(writer, write_header);
   if (!header_result.success) {
     Result<std::vector<uint8_t>> result;
     result.success = false;
@@ -2746,6 +3202,12 @@ Result<std::vector<uint8_t>> SaveToMemory(const ImageData& image, int compressio
   std::vector<Channel> sorted_channels = header.channels;
   std::sort(sorted_channels.begin(), sorted_channels.end(),
             [](const Channel& a, const Channel& b) { return a.name < b.name; });
+
+  // Since SaveToMemory always writes HALF data to scanline_buffer,
+  // ensure all channels report HALF pixel_type for compression functions
+  for (auto& ch : sorted_channels) {
+    ch.pixel_type = PIXEL_TYPE_HALF;
+  }
 
   // Process each scanline block
   for (int block = 0; block < num_blocks; block++) {
@@ -2841,6 +3303,27 @@ Result<std::vector<uint8_t>> SaveToMemory(const ImageData& image, int compressio
         break;
       }
 
+      case COMPRESSION_PXR24: {
+#if defined(TINYEXR_USE_MINIZ) || defined(TINYEXR_USE_ZLIB)
+        if (!CompressPxr24V2(scanline_buffer.data(), actual_bytes,
+                             width, num_lines,
+                             static_cast<int>(sorted_channels.size()),
+                             sorted_channels.data(),
+                             compress_buffer, compression_level)) {
+          return Result<std::vector<uint8_t>>::error(
+            ErrorInfo(ErrorCode::CompressionError, "PXR24 compression failed",
+                      "SaveToMemory", writer.tell()));
+        }
+        compressed_size = compress_buffer.size();
+        data_to_write = compress_buffer.data();
+#else
+        // No compression library available - fall back to no compression
+        compressed_size = actual_bytes;
+        data_to_write = scanline_buffer.data();
+#endif
+        break;
+      }
+
       case COMPRESSION_PIZ:
         // PIZ compression is more complex - for now fall back to ZIP
         // TODO: Implement PIZ compression using tinyexr_compress.hh
@@ -2858,6 +3341,34 @@ Result<std::vector<uint8_t>> SaveToMemory(const ImageData& image, int compressio
         compressed_size = actual_bytes;
         data_to_write = scanline_buffer.data();
 #endif
+        break;
+
+      case COMPRESSION_B44:
+        // B44 compression - only works with HALF pixel types
+        if (!CompressB44V2(scanline_buffer.data(), actual_bytes,
+                           compress_buffer, width, num_lines,
+                           static_cast<int>(sorted_channels.size()),
+                           sorted_channels.data(), false)) {
+          return Result<std::vector<uint8_t>>::error(
+            ErrorInfo(ErrorCode::CompressionError, "B44 compression failed",
+                      "SaveToMemory", writer.tell()));
+        }
+        compressed_size = compress_buffer.size();
+        data_to_write = compress_buffer.data();
+        break;
+
+      case COMPRESSION_B44A:
+        // B44A compression - B44 with flat block optimization
+        if (!CompressB44V2(scanline_buffer.data(), actual_bytes,
+                           compress_buffer, width, num_lines,
+                           static_cast<int>(sorted_channels.size()),
+                           sorted_channels.data(), true)) {
+          return Result<std::vector<uint8_t>>::error(
+            ErrorInfo(ErrorCode::CompressionError, "B44A compression failed",
+                      "SaveToMemory", writer.tell()));
+        }
+        compressed_size = compress_buffer.size();
+        data_to_write = compress_buffer.data();
         break;
 
       default:

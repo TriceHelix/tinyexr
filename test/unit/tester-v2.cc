@@ -859,3 +859,368 @@ TEST_CASE("v2: Load PIZ edge case - issue-194 (all zeros)", "[PIZ][Decompress]")
     // The key is that it doesn't crash
   }
 }
+
+// ============================================================================
+// Compression Round-Trip Tests
+// ============================================================================
+
+TEST_CASE("v2: ZIP compression round-trip", "[ZIP][RoundTrip][Compression]") {
+  // Create test image data
+  const int width = 64;
+  const int height = 64;
+
+  tinyexr::v2::ImageData original;
+  original.width = width;
+  original.height = height;
+  original.num_channels = 4;
+  original.rgba.resize(width * height * 4);
+
+  // Fill with test pattern
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      int idx = (y * width + x) * 4;
+      original.rgba[idx + 0] = static_cast<float>(x) / width;
+      original.rgba[idx + 1] = static_cast<float>(y) / height;
+      original.rgba[idx + 2] = static_cast<float>(x + y) / (width + height);
+      original.rgba[idx + 3] = 1.0f;
+    }
+  }
+
+  original.header.compression = tinyexr::v2::COMPRESSION_ZIP;
+  original.header.data_window.min_x = 0;
+  original.header.data_window.min_y = 0;
+  original.header.data_window.max_x = width - 1;
+  original.header.data_window.max_y = height - 1;
+  original.header.display_window = original.header.data_window;
+  original.header.pixel_aspect_ratio = 1.0f;
+  original.header.screen_window_width = 1.0f;
+  original.header.line_order = 0;
+
+  tinyexr::v2::Channel ch_r, ch_g, ch_b, ch_a;
+  ch_r.name = "R"; ch_r.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_r.x_sampling = 1; ch_r.y_sampling = 1;
+  ch_g.name = "G"; ch_g.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_g.x_sampling = 1; ch_g.y_sampling = 1;
+  ch_b.name = "B"; ch_b.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_b.x_sampling = 1; ch_b.y_sampling = 1;
+  ch_a.name = "A"; ch_a.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_a.x_sampling = 1; ch_a.y_sampling = 1;
+  original.header.channels.push_back(ch_a);
+  original.header.channels.push_back(ch_b);
+  original.header.channels.push_back(ch_g);
+  original.header.channels.push_back(ch_r);
+
+  SECTION("Save and load ZIP") {
+    auto save_result = tinyexr::v2::SaveToMemory(original, 6);
+    REQUIRE(save_result.success == true);
+    printf("ZIP: Saved %zu bytes\n", save_result.value.size());
+
+    auto load_result = tinyexr::v2::LoadFromMemory(save_result.value.data(),
+                                                    save_result.value.size());
+    REQUIRE(load_result.success == true);
+
+    size_t num_pixels = width * height * 4;
+    int diff_count = 0;
+    for (size_t i = 0; i < num_pixels; i++) {
+      float diff = std::abs(load_result.value.rgba[i] - original.rgba[i]);
+      if (diff > 0.01f) diff_count++;
+    }
+    printf("ZIP: Pixels differing: %d\n", diff_count);
+    if (diff_count > 0) {
+      printf("ZIP: First 16 pixels:\n");
+      for (size_t i = 0; i < 16 && i < num_pixels; i++) {
+        printf("  [%zu] %.4f -> %.4f\n", i, original.rgba[i], load_result.value.rgba[i]);
+      }
+    }
+    REQUIRE(diff_count == 0);
+  }
+}
+
+TEST_CASE("v2: PXR24 compression round-trip", "[PXR24][RoundTrip][Compression]") {
+  // Create test image data
+  const int width = 64;
+  const int height = 64;
+
+  tinyexr::v2::ImageData original;
+  original.width = width;
+  original.height = height;
+  original.num_channels = 4;
+  original.rgba.resize(width * height * 4);
+
+  // Fill with test pattern (various float values)
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      int idx = (y * width + x) * 4;
+      original.rgba[idx + 0] = static_cast<float>(x) / width;          // R: gradient
+      original.rgba[idx + 1] = static_cast<float>(y) / height;         // G: gradient
+      original.rgba[idx + 2] = static_cast<float>(x + y) / (width + height); // B: diagonal
+      original.rgba[idx + 3] = 1.0f;                                   // A: constant
+    }
+  }
+
+  // Set up header with PXR24 compression
+  original.header.compression = tinyexr::v2::COMPRESSION_PXR24;
+  original.header.data_window.min_x = 0;
+  original.header.data_window.min_y = 0;
+  original.header.data_window.max_x = width - 1;
+  original.header.data_window.max_y = height - 1;
+  original.header.display_window = original.header.data_window;
+  original.header.pixel_aspect_ratio = 1.0f;
+  original.header.screen_window_width = 1.0f;
+  original.header.line_order = 0;
+
+  // Add RGBA channels
+  tinyexr::v2::Channel ch_r, ch_g, ch_b, ch_a;
+  ch_r.name = "R"; ch_r.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_r.x_sampling = 1; ch_r.y_sampling = 1;
+  ch_g.name = "G"; ch_g.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_g.x_sampling = 1; ch_g.y_sampling = 1;
+  ch_b.name = "B"; ch_b.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_b.x_sampling = 1; ch_b.y_sampling = 1;
+  ch_a.name = "A"; ch_a.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_a.x_sampling = 1; ch_a.y_sampling = 1;
+  original.header.channels.push_back(ch_a);  // EXR channels are sorted alphabetically
+  original.header.channels.push_back(ch_b);
+  original.header.channels.push_back(ch_g);
+  original.header.channels.push_back(ch_r);
+
+  SECTION("Save and load PXR24") {
+    // Save to memory with PXR24 compression
+    auto save_result = tinyexr::v2::SaveToMemory(original, 6);
+
+    if (!save_result.success) {
+      INFO("Save error: " + save_result.error_string());
+    }
+    REQUIRE(save_result.success == true);
+    REQUIRE(save_result.value.size() > 0);
+
+    // Verify the saved data uses PXR24 compression
+    // (compression byte is at a known offset in EXR header)
+    INFO("Saved " << save_result.value.size() << " bytes");
+
+    // Load it back
+    auto load_result = tinyexr::v2::LoadFromMemory(save_result.value.data(),
+                                                    save_result.value.size());
+
+    if (!load_result.success) {
+      INFO("Load error: " + load_result.error_string());
+    }
+    if (!load_result.warnings.empty()) {
+      INFO("Load warnings: " + load_result.warnings_string());
+    }
+    REQUIRE(load_result.success == true);
+
+    // Verify dimensions match
+    REQUIRE(load_result.value.width == original.width);
+    REQUIRE(load_result.value.height == original.height);
+
+    // Verify pixel data matches (with tolerance for HALF precision)
+    // HALF has ~3 decimal digits of precision (10-bit mantissa)
+    size_t num_pixels = width * height * 4;
+    REQUIRE(load_result.value.rgba.size() == num_pixels);
+
+    int diff_count = 0;
+    float max_diff = 0.0f;
+    size_t first_diff_idx = 0;
+    for (size_t i = 0; i < num_pixels; i++) {
+      float diff = std::abs(load_result.value.rgba[i] - original.rgba[i]);
+      if (diff > 0.01f) {  // ~1% tolerance for HALF precision
+        if (diff_count == 0) first_diff_idx = i;
+        diff_count++;
+        if (diff > max_diff) max_diff = diff;
+      }
+    }
+
+    if (diff_count > 0) {
+      printf("Pixels differing: %d, max diff: %.4f\n", diff_count, max_diff);
+      // Show first few pixels for debugging
+      printf("First 16 pixels (idx: orig -> loaded):\n");
+      for (size_t i = 0; i < 16 && i < num_pixels; i++) {
+        printf("  [%zu] %.4f -> %.4f\n", i, original.rgba[i], load_result.value.rgba[i]);
+      }
+      printf("First diff at idx %zu: orig=%.4f loaded=%.4f\n",
+             first_diff_idx, original.rgba[first_diff_idx], load_result.value.rgba[first_diff_idx]);
+    }
+
+    // Allow some precision loss due to HALF format
+    REQUIRE(diff_count == 0);
+  }
+}
+
+TEST_CASE("v2: B44 compression round-trip", "[B44][RoundTrip][Compression]") {
+  // Create test image data
+  const int width = 64;
+  const int height = 64;
+
+  tinyexr::v2::ImageData original;
+  original.width = width;
+  original.height = height;
+  original.num_channels = 4;
+  original.rgba.resize(width * height * 4);
+
+  // Fill with gradient pattern
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      size_t idx = (y * width + x) * 4;
+      original.rgba[idx + 0] = static_cast<float>(x) / width;            // R: horizontal
+      original.rgba[idx + 1] = static_cast<float>(y) / height;           // G: vertical
+      original.rgba[idx + 2] = static_cast<float>(x + y) / (width + height); // B: diagonal
+      original.rgba[idx + 3] = 1.0f;                                     // A: constant
+    }
+  }
+
+  // Set up header with B44 compression
+  original.header.compression = tinyexr::v2::COMPRESSION_B44;
+  original.header.data_window.min_x = 0;
+  original.header.data_window.min_y = 0;
+  original.header.data_window.max_x = width - 1;
+  original.header.data_window.max_y = height - 1;
+  original.header.display_window = original.header.data_window;
+  original.header.pixel_aspect_ratio = 1.0f;
+  original.header.line_order = 0;
+
+  // Add RGBA channels (sorted alphabetically for EXR)
+  tinyexr::v2::Channel ch_r, ch_g, ch_b, ch_a;
+  ch_r.name = "R"; ch_r.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_r.x_sampling = 1; ch_r.y_sampling = 1;
+  ch_g.name = "G"; ch_g.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_g.x_sampling = 1; ch_g.y_sampling = 1;
+  ch_b.name = "B"; ch_b.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_b.x_sampling = 1; ch_b.y_sampling = 1;
+  ch_a.name = "A"; ch_a.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_a.x_sampling = 1; ch_a.y_sampling = 1;
+  original.header.channels.push_back(ch_a);
+  original.header.channels.push_back(ch_b);
+  original.header.channels.push_back(ch_g);
+  original.header.channels.push_back(ch_r);
+
+  SECTION("Save and load B44") {
+    // Save to memory with B44 compression
+    auto save_result = tinyexr::v2::SaveToMemory(original, 6);
+
+    if (!save_result.success) {
+      INFO("Save error: " + save_result.error_string());
+    }
+    REQUIRE(save_result.success == true);
+    REQUIRE(save_result.value.size() > 0);
+
+    INFO("Saved " << save_result.value.size() << " bytes");
+
+    // Load it back
+    auto load_result = tinyexr::v2::LoadFromMemory(save_result.value.data(),
+                                                    save_result.value.size());
+
+    if (!load_result.success) {
+      INFO("Load error: " + load_result.error_string());
+    }
+    if (!load_result.warnings.empty()) {
+      INFO("Load warnings: " + load_result.warnings_string());
+    }
+    REQUIRE(load_result.success == true);
+
+    // Verify dimensions match
+    REQUIRE(load_result.value.width == original.width);
+    REQUIRE(load_result.value.height == original.height);
+
+    // Verify pixel data matches (B44 is lossy, use larger tolerance)
+    size_t num_pixels = width * height * 4;
+    REQUIRE(load_result.value.rgba.size() == num_pixels);
+
+    int diff_count = 0;
+    float max_diff = 0.0f;
+    // B44 uses 6-bit deltas, so error can be up to ~1/32 of value range
+    const float tolerance = 0.05f;
+    for (size_t i = 0; i < num_pixels; i++) {
+      float diff = std::abs(load_result.value.rgba[i] - original.rgba[i]);
+      if (diff > tolerance) {
+        diff_count++;
+        if (diff > max_diff) max_diff = diff;
+      }
+    }
+
+    if (diff_count > 0) {
+      INFO("Pixels differing beyond tolerance: " << diff_count << ", max diff: " << max_diff);
+    }
+
+    // B44 is lossy, allow some differences but not too many
+    REQUIRE(diff_count < static_cast<int>(num_pixels * 0.05));  // Less than 5% of pixels
+  }
+}
+
+TEST_CASE("v2: B44A compression round-trip", "[B44A][RoundTrip][Compression]") {
+  // Create test image with flat areas (B44A optimization target)
+  const int width = 64;
+  const int height = 64;
+
+  tinyexr::v2::ImageData original;
+  original.width = width;
+  original.height = height;
+  original.num_channels = 4;
+  original.rgba.resize(width * height * 4);
+
+  // Fill with large flat areas (8x8 blocks of same color)
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      size_t idx = (y * width + x) * 4;
+      int block_x = x / 8;
+      int block_y = y / 8;
+      float val = static_cast<float>((block_x + block_y) % 4) / 4.0f;
+      original.rgba[idx + 0] = val;
+      original.rgba[idx + 1] = val;
+      original.rgba[idx + 2] = val;
+      original.rgba[idx + 3] = 1.0f;
+    }
+  }
+
+  // Set up header with B44A compression
+  original.header.compression = tinyexr::v2::COMPRESSION_B44A;
+  original.header.data_window.min_x = 0;
+  original.header.data_window.min_y = 0;
+  original.header.data_window.max_x = width - 1;
+  original.header.data_window.max_y = height - 1;
+  original.header.display_window = original.header.data_window;
+  original.header.pixel_aspect_ratio = 1.0f;
+  original.header.line_order = 0;
+
+  // Add RGBA channels
+  tinyexr::v2::Channel ch_r, ch_g, ch_b, ch_a;
+  ch_r.name = "R"; ch_r.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_r.x_sampling = 1; ch_r.y_sampling = 1;
+  ch_g.name = "G"; ch_g.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_g.x_sampling = 1; ch_g.y_sampling = 1;
+  ch_b.name = "B"; ch_b.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_b.x_sampling = 1; ch_b.y_sampling = 1;
+  ch_a.name = "A"; ch_a.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_a.x_sampling = 1; ch_a.y_sampling = 1;
+  original.header.channels.push_back(ch_a);
+  original.header.channels.push_back(ch_b);
+  original.header.channels.push_back(ch_g);
+  original.header.channels.push_back(ch_r);
+
+  SECTION("Save and load B44A") {
+    auto save_result = tinyexr::v2::SaveToMemory(original, 6);
+
+    if (!save_result.success) {
+      INFO("Save error: " + save_result.error_string());
+    }
+    REQUIRE(save_result.success == true);
+    REQUIRE(save_result.value.size() > 0);
+
+    INFO("Saved " << save_result.value.size() << " bytes");
+
+    auto load_result = tinyexr::v2::LoadFromMemory(save_result.value.data(),
+                                                    save_result.value.size());
+
+    if (!load_result.success) {
+      INFO("Load error: " + load_result.error_string());
+    }
+    REQUIRE(load_result.success == true);
+
+    REQUIRE(load_result.value.width == original.width);
+    REQUIRE(load_result.value.height == original.height);
+
+    // For flat areas, B44A should have perfect reconstruction
+    size_t num_pixels = width * height * 4;
+    int diff_count = 0;
+    float max_diff = 0.0f;
+    const float tolerance = 0.01f;  // Tighter tolerance for flat blocks
+    for (size_t i = 0; i < num_pixels; i++) {
+      float diff = std::abs(load_result.value.rgba[i] - original.rgba[i]);
+      if (diff > tolerance) {
+        diff_count++;
+        if (diff > max_diff) max_diff = diff;
+      }
+    }
+
+    if (diff_count > 0) {
+      INFO("Pixels differing: " << diff_count << ", max diff: " << max_diff);
+    }
+
+    // For flat areas, should have near-perfect reconstruction
+    REQUIRE(diff_count == 0);
+  }
+}
