@@ -488,7 +488,8 @@ inline int64_t getBits(int nBits, int64_t& c, int& lc, const uint8_t*& in,
     if (in >= in_end) {
       return -1;  // Bounds check: prevent reading past buffer
     }
-    c = (c << 8) | static_cast<int64_t>(*in++);
+    // Use unsigned shift to avoid signed overflow UB
+    c = static_cast<int64_t>((static_cast<uint64_t>(c) << 8) | static_cast<uint64_t>(*in++));
     lc += 8;
   }
   lc -= nBits;
@@ -498,7 +499,8 @@ inline int64_t getBits(int nBits, int64_t& c, int& lc, const uint8_t*& in,
 // Legacy getBits without bounds check (for compatibility during transition)
 inline int64_t getBitsUnchecked(int nBits, int64_t& c, int& lc, const uint8_t*& in) {
   while (lc < nBits) {
-    c = (c << 8) | static_cast<int64_t>(*in++);
+    // Use unsigned shift to avoid signed overflow UB
+    c = static_cast<int64_t>((static_cast<uint64_t>(c) << 8) | static_cast<uint64_t>(*in++));
     lc += 8;
   }
   lc -= nBits;
@@ -693,7 +695,8 @@ inline int hufLength(int64_t hcode) { return static_cast<int>(hcode & 63); }
 // Returns false if bounds exceeded
 inline bool hufGetCharSafe(int64_t& c, int& lc, const uint8_t*& in, const uint8_t* ie) {
   if (in >= ie) return false;
-  c = (c << 8) | static_cast<int64_t>(*in++);
+  // Use unsigned shift to avoid signed overflow UB
+  c = static_cast<int64_t>((static_cast<uint64_t>(c) << 8) | static_cast<uint64_t>(*in++));
   lc += 8;
   // Check for bit accumulator overflow (shouldn't happen in normal use)
   if (lc > 64) return false;
@@ -702,7 +705,8 @@ inline bool hufGetCharSafe(int64_t& c, int& lc, const uint8_t*& in, const uint8_
 
 // Get one character and update bit buffer (unchecked, for hot paths)
 inline void hufGetChar(int64_t& c, int& lc, const uint8_t*& in) {
-  c = (c << 8) | static_cast<int64_t>(*in++);
+  // Use unsigned shift to avoid signed overflow UB
+  c = static_cast<int64_t>((static_cast<uint64_t>(c) << 8) | static_cast<uint64_t>(*in++));
   lc += 8;
 }
 
@@ -781,7 +785,8 @@ inline bool hufDecode(const int64_t* hcode, const HufDec* hdecod,
   // Main decode loop - optimized for the common case (short codes)
   while (PIZ_LIKELY(in < ie)) {
     // Inline byte read for speed (bounds already checked by loop condition)
-    c = (c << 8) | static_cast<int64_t>(*in++);
+    // Use unsigned shift to avoid signed overflow UB
+    c = static_cast<int64_t>((static_cast<uint64_t>(c) << 8) | static_cast<uint64_t>(*in++));
     lc += 8;
     if (PIZ_UNLIKELY(lc > 64)) {
       if (debug) fprintf(stderr, "Bit accumulator overflow\n");
@@ -799,8 +804,10 @@ inline bool hufDecode(const int64_t* hcode, const HufDec* hdecod,
       const int tableIndex = static_cast<int>((c >> (lc - HUF_DECBITS)) & HUF_DECMASK);
       const HufDec& pl = hdecod[tableIndex];
 
-      // Prefetch next table entry
-      PIZ_PREFETCH(&hdecod[(c >> (lc - HUF_DECBITS - 8)) & HUF_DECMASK]);
+      // Prefetch next table entry (only if enough bits available to avoid negative shift)
+      if (lc >= HUF_DECBITS + 8) {
+        PIZ_PREFETCH(&hdecod[(c >> (lc - HUF_DECBITS - 8)) & HUF_DECMASK]);
+      }
 
       if (PIZ_LIKELY(pl.len > 0)) {
         // Short code path (most common case - ~95% of codes)
@@ -849,7 +856,8 @@ inline bool hufDecode(const int64_t* hcode, const HufDec* hdecod,
 
           // Read more bytes if needed
           while (lc < l && in < ie) {
-            c = (c << 8) | static_cast<int64_t>(*in++);
+            // Use unsigned shift to avoid signed overflow UB
+            c = static_cast<int64_t>((static_cast<uint64_t>(c) << 8) | static_cast<uint64_t>(*in++));
             lc += 8;
           }
 
