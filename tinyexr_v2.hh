@@ -808,6 +808,15 @@ Result<std::vector<uint8_t>> SaveToMemory(const ImageData& image);
 // Save image data to file
 Result<void> SaveToFile(const char* filename, const ImageData& image, int compression_level = 6);
 
+// Save tiled EXR to memory
+// The image.header must have tiled=true, tile_size_x>0, and tile_size_y>0
+// compression_level: 1-9 for ZIP compression (6 = default)
+Result<std::vector<uint8_t>> SaveTiledToMemory(const ImageData& image, int compression_level);
+Result<std::vector<uint8_t>> SaveTiledToMemory(const ImageData& image);
+
+// Save tiled EXR to file
+Result<void> SaveTiledToFile(const char* filename, const ImageData& image, int compression_level = 6);
+
 // Save multipart image data to memory
 // compression_level: 1-9 for ZIP compression (6 = default)
 Result<std::vector<uint8_t>> SaveMultipartToMemory(const MultipartImageData& multipart, int compression_level);

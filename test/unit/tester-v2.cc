@@ -1224,3 +1224,204 @@ TEST_CASE("v2: B44A compression round-trip", "[B44A][RoundTrip][Compression]") {
     REQUIRE(diff_count == 0);
   }
 }
+
+// ============================================================================
+// Tiled EXR Writing Tests
+// ============================================================================
+
+TEST_CASE("v2: Tiled EXR writing with ZIP", "[Tiled][ZIP][RoundTrip]") {
+  // Create test image data
+  const int width = 100;  // Non-tile-aligned
+  const int height = 75;  // Non-tile-aligned
+
+  tinyexr::v2::ImageData original;
+  original.width = width;
+  original.height = height;
+  original.num_channels = 4;
+  original.rgba.resize(width * height * 4);
+
+  // Fill with gradient pattern
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      int idx = (y * width + x) * 4;
+      original.rgba[idx + 0] = static_cast<float>(x) / width;
+      original.rgba[idx + 1] = static_cast<float>(y) / height;
+      original.rgba[idx + 2] = 0.5f;
+      original.rgba[idx + 3] = 1.0f;
+    }
+  }
+
+  // Set up header for tiled format
+  original.header.compression = tinyexr::v2::COMPRESSION_ZIP;
+  original.header.data_window.min_x = 0;
+  original.header.data_window.min_y = 0;
+  original.header.data_window.max_x = width - 1;
+  original.header.data_window.max_y = height - 1;
+  original.header.display_window = original.header.data_window;
+  original.header.pixel_aspect_ratio = 1.0f;
+  original.header.screen_window_width = 1.0f;
+  original.header.line_order = 0;
+  original.header.tiled = true;
+  original.header.tile_size_x = 32;
+  original.header.tile_size_y = 32;
+  original.header.tile_level_mode = 0;  // ONE_LEVEL
+  original.header.tile_rounding_mode = 0;  // ROUND_DOWN
+
+  tinyexr::v2::Channel ch_r, ch_g, ch_b, ch_a;
+  ch_r.name = "R"; ch_r.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_r.x_sampling = 1; ch_r.y_sampling = 1;
+  ch_g.name = "G"; ch_g.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_g.x_sampling = 1; ch_g.y_sampling = 1;
+  ch_b.name = "B"; ch_b.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_b.x_sampling = 1; ch_b.y_sampling = 1;
+  ch_a.name = "A"; ch_a.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_a.x_sampling = 1; ch_a.y_sampling = 1;
+  original.header.channels.push_back(ch_a);
+  original.header.channels.push_back(ch_b);
+  original.header.channels.push_back(ch_g);
+  original.header.channels.push_back(ch_r);
+
+  SECTION("Save and load tiled ZIP") {
+    auto save_result = tinyexr::v2::SaveTiledToMemory(original, 6);
+
+    if (!save_result.success) {
+      INFO("Save error: " + save_result.error_string());
+    }
+    REQUIRE(save_result.success == true);
+    REQUIRE(save_result.value.size() > 0);
+
+    INFO("Tiled ZIP: Saved " << save_result.value.size() << " bytes");
+
+    // Load back
+    auto load_result = tinyexr::v2::LoadFromMemory(save_result.value.data(),
+                                                    save_result.value.size());
+
+    if (!load_result.success) {
+      INFO("Load error: " + load_result.error_string());
+    }
+    REQUIRE(load_result.success == true);
+
+    REQUIRE(load_result.value.width == original.width);
+    REQUIRE(load_result.value.height == original.height);
+
+    // Verify pixels
+    size_t num_pixels = width * height * 4;
+    int diff_count = 0;
+    float max_diff = 0.0f;
+    const float tolerance = 0.002f;  // FP16 precision
+    for (size_t i = 0; i < num_pixels; i++) {
+      float diff = std::abs(load_result.value.rgba[i] - original.rgba[i]);
+      if (diff > tolerance) {
+        diff_count++;
+        if (diff > max_diff) max_diff = diff;
+      }
+    }
+
+    if (diff_count > 0) {
+      INFO("Tiled ZIP: Pixels differing: " << diff_count << ", max diff: " << max_diff);
+    }
+
+    REQUIRE(diff_count == 0);
+  }
+}
+
+TEST_CASE("v2: Tiled EXR writing with various compressions", "[Tiled][Compression][RoundTrip]") {
+  // Create test image data
+  const int width = 64;
+  const int height = 64;
+
+  tinyexr::v2::ImageData original;
+  original.width = width;
+  original.height = height;
+  original.num_channels = 4;
+  original.rgba.resize(width * height * 4);
+
+  // Fill with gradient pattern
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      int idx = (y * width + x) * 4;
+      original.rgba[idx + 0] = static_cast<float>(x) / width;
+      original.rgba[idx + 1] = static_cast<float>(y) / height;
+      original.rgba[idx + 2] = 0.5f;
+      original.rgba[idx + 3] = 1.0f;
+    }
+  }
+
+  // Set up header for tiled format
+  original.header.data_window.min_x = 0;
+  original.header.data_window.min_y = 0;
+  original.header.data_window.max_x = width - 1;
+  original.header.data_window.max_y = height - 1;
+  original.header.display_window = original.header.data_window;
+  original.header.pixel_aspect_ratio = 1.0f;
+  original.header.screen_window_width = 1.0f;
+  original.header.line_order = 0;
+  original.header.tiled = true;
+  original.header.tile_size_x = 32;
+  original.header.tile_size_y = 32;
+  original.header.tile_level_mode = 0;
+  original.header.tile_rounding_mode = 0;
+
+  tinyexr::v2::Channel ch_r, ch_g, ch_b, ch_a;
+  ch_r.name = "R"; ch_r.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_r.x_sampling = 1; ch_r.y_sampling = 1;
+  ch_g.name = "G"; ch_g.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_g.x_sampling = 1; ch_g.y_sampling = 1;
+  ch_b.name = "B"; ch_b.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_b.x_sampling = 1; ch_b.y_sampling = 1;
+  ch_a.name = "A"; ch_a.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_a.x_sampling = 1; ch_a.y_sampling = 1;
+  original.header.channels.push_back(ch_a);
+  original.header.channels.push_back(ch_b);
+  original.header.channels.push_back(ch_g);
+  original.header.channels.push_back(ch_r);
+
+  auto test_compression = [&](int compression, const char* name, float tolerance) {
+    original.header.compression = compression;
+
+    auto save_result = tinyexr::v2::SaveTiledToMemory(original, 6);
+    if (!save_result.success) {
+      INFO(name << ": Save error: " + save_result.error_string());
+    }
+    REQUIRE(save_result.success == true);
+    REQUIRE(save_result.value.size() > 0);
+
+    INFO(name << ": Saved " << save_result.value.size() << " bytes");
+
+    auto load_result = tinyexr::v2::LoadFromMemory(save_result.value.data(),
+                                                    save_result.value.size());
+    if (!load_result.success) {
+      INFO(name << ": Load error: " + load_result.error_string());
+    }
+    REQUIRE(load_result.success == true);
+
+    REQUIRE(load_result.value.width == original.width);
+    REQUIRE(load_result.value.height == original.height);
+
+    size_t num_pixels = width * height * 4;
+    int diff_count = 0;
+    float max_diff = 0.0f;
+    for (size_t i = 0; i < num_pixels; i++) {
+      float diff = std::abs(load_result.value.rgba[i] - original.rgba[i]);
+      if (diff > tolerance) {
+        diff_count++;
+        if (diff > max_diff) max_diff = diff;
+      }
+    }
+
+    INFO(name << ": Pixels differing: " << diff_count << ", max diff: " << max_diff);
+    REQUIRE(diff_count == 0);
+  };
+
+  SECTION("Tiled NONE compression") {
+    test_compression(tinyexr::v2::COMPRESSION_NONE, "Tiled NONE", 0.002f);
+  }
+
+  SECTION("Tiled RLE compression") {
+    test_compression(tinyexr::v2::COMPRESSION_RLE, "Tiled RLE", 0.002f);
+  }
+
+  SECTION("Tiled ZIPS compression") {
+    test_compression(tinyexr::v2::COMPRESSION_ZIPS, "Tiled ZIPS", 0.002f);
+  }
+
+  SECTION("Tiled ZIP compression") {
+    test_compression(tinyexr::v2::COMPRESSION_ZIP, "Tiled ZIP", 0.002f);
+  }
+
+  SECTION("Tiled B44 compression") {
+    test_compression(tinyexr::v2::COMPRESSION_B44, "Tiled B44", 0.05f);  // Lossy
+  }
+}
