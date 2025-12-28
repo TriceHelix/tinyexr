@@ -465,12 +465,20 @@ inline void float_to_half_4_sse2(const float* src, uint16_t* dst) {
   // Combine
   __m128i result = _mm_or_si128(sign, _mm_or_si128(exp_half, mant_half));
 
-  // Pack to 16-bit
-  result = _mm_and_si128(result, _mm_set1_epi32(0xFFFF));
-  result = _mm_packs_epi32(result, result);
-
-  // Store lower 64 bits (4 x 16-bit values)
-  _mm_storel_epi64(reinterpret_cast<__m128i*>(dst), result);
+  // Pack to 16-bit using shuffle (SSE2 compatible, avoids signed saturation)
+  // We need to extract lower 16 bits of each 32-bit lane
+  // Shuffle bytes: take bytes 0,1 from lane 0, bytes 0,1 from lane 1, etc.
+  // SSE2 doesn't have pshufb, so use shifts and ORs
+  __m128i lo = _mm_and_si128(result, _mm_set1_epi32(0xFFFF));
+  __m128i hi = _mm_srli_epi64(result, 16);
+  hi = _mm_and_si128(hi, _mm_set1_epi32(0xFFFF0000));
+  result = _mm_or_si128(lo, hi);
+  // Now we have: [h0|h1|??|??|h2|h3|??|??]
+  // Extract and store
+  dst[0] = static_cast<uint16_t>(_mm_extract_epi16(result, 0));
+  dst[1] = static_cast<uint16_t>(_mm_extract_epi16(result, 2));
+  dst[2] = static_cast<uint16_t>(_mm_extract_epi16(result, 4));
+  dst[3] = static_cast<uint16_t>(_mm_extract_epi16(result, 6));
 }
 
 #endif  // TINYEXR_SIMD_SSE2
