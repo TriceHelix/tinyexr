@@ -3464,6 +3464,215 @@ Result<void> SaveToFile(const char* filename, const ImageData& image, int compre
 // Tiled Image Writing
 // ============================================================================
 
+// Helper: Downsample image by 2x using box filter
+static std::vector<float> DownsampleImage(const float* src, int src_w, int src_h,
+                                           int* dst_w, int* dst_h) {
+  *dst_w = std::max(1, src_w / 2);
+  *dst_h = std::max(1, src_h / 2);
+
+  std::vector<float> dst(static_cast<size_t>(*dst_w) * (*dst_h) * 4);
+
+  for (int dy = 0; dy < *dst_h; dy++) {
+    for (int dx = 0; dx < *dst_w; dx++) {
+      // Source coordinates (2x2 block)
+      int sx0 = dx * 2;
+      int sy0 = dy * 2;
+      int sx1 = std::min(sx0 + 1, src_w - 1);
+      int sy1 = std::min(sy0 + 1, src_h - 1);
+
+      // Average 2x2 block for each channel
+      for (int c = 0; c < 4; c++) {
+        float v00 = src[(sy0 * src_w + sx0) * 4 + c];
+        float v10 = src[(sy0 * src_w + sx1) * 4 + c];
+        float v01 = src[(sy1 * src_w + sx0) * 4 + c];
+        float v11 = src[(sy1 * src_w + sx1) * 4 + c];
+        dst[(dy * (*dst_w) + dx) * 4 + c] = (v00 + v10 + v01 + v11) * 0.25f;
+      }
+    }
+  }
+
+  return dst;
+}
+
+// Helper: Write a single tile with compression
+static bool WriteTile(Writer& writer, const float* image_data,
+                      int image_w, int image_h,
+                      int tx, int ty, int tile_w, int tile_h,
+                      int level_x, int level_y,
+                      const std::vector<Channel>& sorted_channels,
+                      int compression, int compression_level,
+                      std::vector<uint8_t>& tile_buffer,
+                      std::vector<uint8_t>& reorder_buffer,
+                      std::vector<uint8_t>& compress_buffer) {
+  // Map channel names to RGBA indices
+  auto GetRGBAIndex = [](const std::string& name) -> int {
+    if (name == "R" || name == "r") return 0;
+    if (name == "G" || name == "g") return 1;
+    if (name == "B" || name == "b") return 2;
+    if (name == "A" || name == "a") return 3;
+    if (name == "Y" || name == "y") return 0;
+    return -1;
+  };
+
+  // Calculate tile bounds
+  int x0 = tx * tile_w;
+  int y0 = ty * tile_h;
+  int x1 = std::min(x0 + tile_w, image_w);
+  int y1 = std::min(y0 + tile_h, image_h);
+  int actual_w = x1 - x0;
+  int actual_h = y1 - y0;
+
+  if (actual_w <= 0 || actual_h <= 0) return false;
+
+  // Write tile header: tile_x, tile_y, level_x, level_y
+  if (!writer.write4(static_cast<uint32_t>(tx))) return false;
+  if (!writer.write4(static_cast<uint32_t>(ty))) return false;
+  if (!writer.write4(static_cast<uint32_t>(level_x))) return false;
+  if (!writer.write4(static_cast<uint32_t>(level_y))) return false;
+
+  // Fill tile buffer with pixel data
+  size_t num_channels = sorted_channels.size();
+  size_t bytes_per_scanline = static_cast<size_t>(actual_w) * num_channels * 2;
+  size_t actual_tile_size = bytes_per_scanline * actual_h;
+
+  std::memset(tile_buffer.data(), 0, tile_buffer.size());
+
+  for (int line = 0; line < actual_h; line++) {
+    int y = y0 + line;
+    uint8_t* line_ptr = tile_buffer.data() + line * bytes_per_scanline;
+
+    size_t ch_offset = 0;
+    for (size_t ch = 0; ch < sorted_channels.size(); ch++) {
+      int rgba_idx = GetRGBAIndex(sorted_channels[ch].name);
+      if (rgba_idx < 0) rgba_idx = static_cast<int>(ch % 4);
+
+      for (int x = 0; x < actual_w; x++) {
+        int src_x = x0 + x;
+        float val = image_data[y * image_w * 4 + src_x * 4 + rgba_idx];
+        uint16_t half_val = FloatToHalf(val);
+
+        line_ptr[ch_offset + x * 2 + 0] = static_cast<uint8_t>(half_val & 0xFF);
+        line_ptr[ch_offset + x * 2 + 1] = static_cast<uint8_t>(half_val >> 8);
+      }
+      ch_offset += actual_w * 2;
+    }
+  }
+
+  // Apply compression
+  size_t compressed_size = actual_tile_size;
+  const uint8_t* data_to_write = tile_buffer.data();
+
+  switch (compression) {
+    case COMPRESSION_NONE:
+      compressed_size = actual_tile_size;
+      data_to_write = tile_buffer.data();
+      break;
+
+    case COMPRESSION_RLE:
+      ReorderBytesForCompression(tile_buffer.data(), reorder_buffer.data(), actual_tile_size);
+      ApplyDeltaPredictorEncode(reorder_buffer.data(), actual_tile_size);
+      if (!CompressRle(reorder_buffer.data(), actual_tile_size, compress_buffer)) {
+        compressed_size = actual_tile_size;
+        data_to_write = tile_buffer.data();
+      } else {
+        compressed_size = compress_buffer.size();
+        data_to_write = compress_buffer.data();
+      }
+      break;
+
+    case COMPRESSION_ZIPS:
+    case COMPRESSION_ZIP:
+#if defined(TINYEXR_USE_MINIZ) || defined(TINYEXR_USE_ZLIB)
+      ReorderBytesForCompression(tile_buffer.data(), reorder_buffer.data(), actual_tile_size);
+      ApplyDeltaPredictorEncode(reorder_buffer.data(), actual_tile_size);
+      if (!CompressZip(reorder_buffer.data(), actual_tile_size, compress_buffer, compression_level)) {
+        compressed_size = actual_tile_size;
+        data_to_write = tile_buffer.data();
+      } else {
+        compressed_size = compress_buffer.size();
+        data_to_write = compress_buffer.data();
+      }
+#else
+      compressed_size = actual_tile_size;
+      data_to_write = tile_buffer.data();
+#endif
+      break;
+
+    case COMPRESSION_PXR24:
+#if defined(TINYEXR_USE_MINIZ) || defined(TINYEXR_USE_ZLIB)
+      if (!CompressPxr24V2(tile_buffer.data(), actual_tile_size,
+                           actual_w, actual_h,
+                           static_cast<int>(sorted_channels.size()),
+                           sorted_channels.data(),
+                           compress_buffer, compression_level)) {
+        compressed_size = actual_tile_size;
+        data_to_write = tile_buffer.data();
+      } else {
+        compressed_size = compress_buffer.size();
+        data_to_write = compress_buffer.data();
+      }
+#else
+      compressed_size = actual_tile_size;
+      data_to_write = tile_buffer.data();
+#endif
+      break;
+
+    case COMPRESSION_PIZ:
+#if defined(TINYEXR_USE_MINIZ) || defined(TINYEXR_USE_ZLIB)
+      ReorderBytesForCompression(tile_buffer.data(), reorder_buffer.data(), actual_tile_size);
+      ApplyDeltaPredictorEncode(reorder_buffer.data(), actual_tile_size);
+      if (!CompressZip(reorder_buffer.data(), actual_tile_size, compress_buffer, compression_level)) {
+        compressed_size = actual_tile_size;
+        data_to_write = tile_buffer.data();
+      } else {
+        compressed_size = compress_buffer.size();
+        data_to_write = compress_buffer.data();
+      }
+#else
+      compressed_size = actual_tile_size;
+      data_to_write = tile_buffer.data();
+#endif
+      break;
+
+    case COMPRESSION_B44:
+      if (!CompressB44V2(tile_buffer.data(), actual_tile_size,
+                         compress_buffer, actual_w, actual_h,
+                         static_cast<int>(sorted_channels.size()),
+                         sorted_channels.data(), false)) {
+        compressed_size = actual_tile_size;
+        data_to_write = tile_buffer.data();
+      } else {
+        compressed_size = compress_buffer.size();
+        data_to_write = compress_buffer.data();
+      }
+      break;
+
+    case COMPRESSION_B44A:
+      if (!CompressB44V2(tile_buffer.data(), actual_tile_size,
+                         compress_buffer, actual_w, actual_h,
+                         static_cast<int>(sorted_channels.size()),
+                         sorted_channels.data(), true)) {
+        compressed_size = actual_tile_size;
+        data_to_write = tile_buffer.data();
+      } else {
+        compressed_size = compress_buffer.size();
+        data_to_write = compress_buffer.data();
+      }
+      break;
+
+    default:
+      compressed_size = actual_tile_size;
+      data_to_write = tile_buffer.data();
+      break;
+  }
+
+  // Write data size and data
+  if (!writer.write4(static_cast<uint32_t>(compressed_size))) return false;
+  if (!writer.write(compressed_size, data_to_write)) return false;
+
+  return true;
+}
+
 Result<std::vector<uint8_t>> SaveTiledToMemory(const ImageData& image, int compression_level) {
   Writer writer;
   writer.set_context("Saving tiled EXR to memory");
@@ -3537,228 +3746,189 @@ Result<std::vector<uint8_t>> SaveTiledToMemory(const ImageData& image, int compr
     return result;
   }
 
-  // Calculate tile counts
-  int num_x_tiles = (width + tile_w - 1) / tile_w;
-  int num_y_tiles = (height + tile_h - 1) / tile_h;
-  int total_tiles = num_x_tiles * num_y_tiles;
+  // Build sorted channel list
+  std::vector<Channel> sorted_channels = header.channels;
+  std::sort(sorted_channels.begin(), sorted_channels.end(),
+            [](const Channel& a, const Channel& b) { return a.name < b.name; });
+  for (auto& ch : sorted_channels) {
+    ch.pixel_type = PIXEL_TYPE_HALF;
+  }
+
+  // Determine tile level mode
+  int tile_level_mode = write_header.tile_level_mode;
+  int tile_rounding_mode = write_header.tile_rounding_mode;
+
+  // Calculate number of levels
+  int num_x_levels = CalculateNumXLevels(write_header);
+  int num_y_levels = CalculateNumYLevels(write_header);
+
+  // Calculate total tile count across all levels
+  int total_tiles = 0;
+  std::vector<std::vector<int>> tiles_per_level;  // [level][0]=num_x, [level][1]=num_y, [level][2]=level_w, [level][3]=level_h
+
+  if (tile_level_mode == TILE_ONE_LEVEL) {
+    // ONE_LEVEL: just base level
+    int num_x = (width + tile_w - 1) / tile_w;
+    int num_y = (height + tile_h - 1) / tile_h;
+    total_tiles = num_x * num_y;
+    tiles_per_level.push_back({num_x, num_y, width, height});
+  } else if (tile_level_mode == TILE_MIPMAP_LEVELS) {
+    // MIPMAP_LEVELS: symmetric downsample
+    for (int level = 0; level < num_x_levels; level++) {
+      int level_w = LevelSize(width, level, tile_rounding_mode);
+      int level_h = LevelSize(height, level, tile_rounding_mode);
+      int num_x = (level_w + tile_w - 1) / tile_w;
+      int num_y = (level_h + tile_h - 1) / tile_h;
+      total_tiles += num_x * num_y;
+      tiles_per_level.push_back({num_x, num_y, level_w, level_h});
+    }
+  } else if (tile_level_mode == TILE_RIPMAP_LEVELS) {
+    // RIPMAP_LEVELS: independent X/Y downsample
+    for (int ly = 0; ly < num_y_levels; ly++) {
+      for (int lx = 0; lx < num_x_levels; lx++) {
+        int level_w = LevelSize(width, lx, tile_rounding_mode);
+        int level_h = LevelSize(height, ly, tile_rounding_mode);
+        int num_x = (level_w + tile_w - 1) / tile_w;
+        int num_y = (level_h + tile_h - 1) / tile_h;
+        total_tiles += num_x * num_y;
+        tiles_per_level.push_back({num_x, num_y, level_w, level_h});
+      }
+    }
+  }
 
   // Reserve space for offset table
   size_t offset_table_pos = writer.tell();
   for (int i = 0; i < total_tiles; i++) {
-    if (!writer.write8(0)) {  // Placeholder
+    if (!writer.write8(0)) {
       return Result<std::vector<uint8_t>>::error(writer.last_error());
     }
   }
 
-  // Store actual offsets
-  std::vector<uint64_t> offsets(total_tiles);
+  std::vector<uint64_t> offsets;
+  offsets.reserve(total_tiles);
 
   // Work buffers
-  size_t num_channels = header.channels.size();
+  size_t num_channels = sorted_channels.size();
   if (num_channels == 0) num_channels = 4;
-  size_t bytes_per_pixel = num_channels * 2;  // HALF = 2 bytes
-  size_t tile_buffer_size = static_cast<size_t>(tile_w) * tile_h * bytes_per_pixel;
+  size_t tile_buffer_size = static_cast<size_t>(tile_w) * tile_h * num_channels * 2;
 
   std::vector<uint8_t> tile_buffer(tile_buffer_size);
   std::vector<uint8_t> reorder_buffer(tile_buffer_size);
   std::vector<uint8_t> compress_buffer(tile_buffer_size * 2);
 
-  // Map channel names to RGBA indices
-  auto GetRGBAIndex = [&](const std::string& name) -> int {
-    if (name == "R" || name == "r") return 0;
-    if (name == "G" || name == "g") return 1;
-    if (name == "B" || name == "b") return 2;
-    if (name == "A" || name == "a") return 3;
-    if (name == "Y" || name == "y") return 0;
-    return -1;
-  };
+  // Generate mipmap levels (base + downsampled)
+  std::vector<std::vector<float>> mip_levels;
+  std::vector<std::pair<int, int>> mip_dims;  // (width, height) for each level
 
-  // Build sorted channel list
-  std::vector<Channel> sorted_channels = header.channels;
-  std::sort(sorted_channels.begin(), sorted_channels.end(),
-            [](const Channel& a, const Channel& b) { return a.name < b.name; });
+  // Level 0 = original image
+  mip_levels.push_back(image.rgba);
+  mip_dims.push_back({width, height});
 
-  // Ensure sorted channels are HALF type for compression functions
-  for (auto& ch : sorted_channels) {
-    ch.pixel_type = PIXEL_TYPE_HALF;
+  // Generate additional mip levels if needed
+  if (tile_level_mode == TILE_MIPMAP_LEVELS && num_x_levels > 1) {
+    int cur_w = width, cur_h = height;
+    const float* cur_data = image.rgba.data();
+    std::vector<float> prev_level;
+
+    for (int level = 1; level < num_x_levels; level++) {
+      int new_w, new_h;
+      std::vector<float> downsampled = DownsampleImage(cur_data, cur_w, cur_h, &new_w, &new_h);
+      mip_levels.push_back(downsampled);
+      mip_dims.push_back({new_w, new_h});
+      prev_level = std::move(downsampled);
+      cur_data = prev_level.data();
+      cur_w = new_w;
+      cur_h = new_h;
+    }
   }
 
-  // Process each tile
-  for (int ty = 0; ty < num_y_tiles; ty++) {
-    for (int tx = 0; tx < num_x_tiles; tx++) {
-      int tile_idx = ty * num_x_tiles + tx;
-      offsets[tile_idx] = writer.tell();
+  // Write tiles for each level
+  int level_idx = 0;
+  if (tile_level_mode == TILE_ONE_LEVEL) {
+    // Single level
+    int num_x = tiles_per_level[0][0];
+    int num_y = tiles_per_level[0][1];
 
-      // Calculate tile bounds
-      int x0 = tx * tile_w;
-      int y0 = ty * tile_h;
-      int x1 = std::min(x0 + tile_w, width);
-      int y1 = std::min(y0 + tile_h, height);
-      int actual_w = x1 - x0;
-      int actual_h = y1 - y0;
-
-      // Write tile header: tile_x, tile_y, level_x, level_y
-      if (!writer.write4(static_cast<uint32_t>(tx))) {
-        return Result<std::vector<uint8_t>>::error(writer.last_error());
-      }
-      if (!writer.write4(static_cast<uint32_t>(ty))) {
-        return Result<std::vector<uint8_t>>::error(writer.last_error());
-      }
-      if (!writer.write4(0)) {  // level_x = 0 (base level)
-        return Result<std::vector<uint8_t>>::error(writer.last_error());
-      }
-      if (!writer.write4(0)) {  // level_y = 0 (base level)
-        return Result<std::vector<uint8_t>>::error(writer.last_error());
-      }
-
-      // Fill tile buffer with pixel data
-      // EXR tile format: per-scanline, per-channel, HALF pixels
-      size_t bytes_per_scanline = static_cast<size_t>(actual_w) * num_channels * 2;
-      size_t actual_tile_size = bytes_per_scanline * actual_h;
-
-      std::memset(tile_buffer.data(), 0, tile_buffer_size);
-
-      for (int line = 0; line < actual_h; line++) {
-        int y = y0 + line;
-        uint8_t* line_ptr = tile_buffer.data() + line * bytes_per_scanline;
-
-        // Write channels in sorted (alphabetical) order
-        size_t ch_offset = 0;
-        for (size_t ch = 0; ch < sorted_channels.size(); ch++) {
-          int rgba_idx = GetRGBAIndex(sorted_channels[ch].name);
-          if (rgba_idx < 0) rgba_idx = static_cast<int>(ch % 4);
-
-          for (int x = 0; x < actual_w; x++) {
-            int src_x = x0 + x;
-            float val = image.rgba[y * width * 4 + src_x * 4 + rgba_idx];
-            uint16_t half_val = FloatToHalf(val);
-
-            // Write as little-endian
-            line_ptr[ch_offset + x * 2 + 0] = static_cast<uint8_t>(half_val & 0xFF);
-            line_ptr[ch_offset + x * 2 + 1] = static_cast<uint8_t>(half_val >> 8);
-          }
-          ch_offset += actual_w * 2;
+    for (int ty = 0; ty < num_y; ty++) {
+      for (int tx = 0; tx < num_x; tx++) {
+        offsets.push_back(writer.tell());
+        if (!WriteTile(writer, image.rgba.data(), width, height,
+                       tx, ty, tile_w, tile_h, 0, 0,
+                       sorted_channels, header.compression, compression_level,
+                       tile_buffer, reorder_buffer, compress_buffer)) {
+          return Result<std::vector<uint8_t>>::error(
+            ErrorInfo(ErrorCode::CompressionError, "Failed to write tile",
+                      "SaveTiledToMemory", writer.tell()));
         }
       }
+    }
+  } else if (tile_level_mode == TILE_MIPMAP_LEVELS) {
+    // Mipmap levels
+    for (int level = 0; level < num_x_levels; level++) {
+      int level_w = mip_dims[level].first;
+      int level_h = mip_dims[level].second;
+      int num_x = tiles_per_level[level][0];
+      int num_y = tiles_per_level[level][1];
+      const float* level_data = mip_levels[level].data();
 
-      // Apply compression
-      size_t compressed_size = actual_tile_size;
-      const uint8_t* data_to_write = tile_buffer.data();
-
-      switch (header.compression) {
-        case COMPRESSION_NONE:
-          compressed_size = actual_tile_size;
-          data_to_write = tile_buffer.data();
-          break;
-
-        case COMPRESSION_RLE:
-          ReorderBytesForCompression(tile_buffer.data(), reorder_buffer.data(), actual_tile_size);
-          ApplyDeltaPredictorEncode(reorder_buffer.data(), actual_tile_size);
-          if (!CompressRle(reorder_buffer.data(), actual_tile_size, compress_buffer)) {
-            // Fall back to uncompressed
-            compressed_size = actual_tile_size;
-            data_to_write = tile_buffer.data();
-          } else {
-            compressed_size = compress_buffer.size();
-            data_to_write = compress_buffer.data();
+      for (int ty = 0; ty < num_y; ty++) {
+        for (int tx = 0; tx < num_x; tx++) {
+          offsets.push_back(writer.tell());
+          if (!WriteTile(writer, level_data, level_w, level_h,
+                         tx, ty, tile_w, tile_h, level, level,
+                         sorted_channels, header.compression, compression_level,
+                         tile_buffer, reorder_buffer, compress_buffer)) {
+            return Result<std::vector<uint8_t>>::error(
+              ErrorInfo(ErrorCode::CompressionError,
+                        "Failed to write tile at level " + std::to_string(level),
+                        "SaveTiledToMemory", writer.tell()));
           }
-          break;
-
-        case COMPRESSION_ZIPS:
-        case COMPRESSION_ZIP:
-#if defined(TINYEXR_USE_MINIZ) || defined(TINYEXR_USE_ZLIB)
-          ReorderBytesForCompression(tile_buffer.data(), reorder_buffer.data(), actual_tile_size);
-          ApplyDeltaPredictorEncode(reorder_buffer.data(), actual_tile_size);
-          if (!CompressZip(reorder_buffer.data(), actual_tile_size, compress_buffer, compression_level)) {
-            compressed_size = actual_tile_size;
-            data_to_write = tile_buffer.data();
-          } else {
-            compressed_size = compress_buffer.size();
-            data_to_write = compress_buffer.data();
-          }
-#else
-          compressed_size = actual_tile_size;
-          data_to_write = tile_buffer.data();
-#endif
-          break;
-
-        case COMPRESSION_PXR24:
-#if defined(TINYEXR_USE_MINIZ) || defined(TINYEXR_USE_ZLIB)
-          if (!CompressPxr24V2(tile_buffer.data(), actual_tile_size,
-                               actual_w, actual_h,
-                               static_cast<int>(sorted_channels.size()),
-                               sorted_channels.data(),
-                               compress_buffer, compression_level)) {
-            compressed_size = actual_tile_size;
-            data_to_write = tile_buffer.data();
-          } else {
-            compressed_size = compress_buffer.size();
-            data_to_write = compress_buffer.data();
-          }
-#else
-          compressed_size = actual_tile_size;
-          data_to_write = tile_buffer.data();
-#endif
-          break;
-
-        case COMPRESSION_PIZ:
-          // PIZ compression - fall back to ZIP for now
-#if defined(TINYEXR_USE_MINIZ) || defined(TINYEXR_USE_ZLIB)
-          ReorderBytesForCompression(tile_buffer.data(), reorder_buffer.data(), actual_tile_size);
-          ApplyDeltaPredictorEncode(reorder_buffer.data(), actual_tile_size);
-          if (!CompressZip(reorder_buffer.data(), actual_tile_size, compress_buffer, compression_level)) {
-            compressed_size = actual_tile_size;
-            data_to_write = tile_buffer.data();
-          } else {
-            compressed_size = compress_buffer.size();
-            data_to_write = compress_buffer.data();
-          }
-#else
-          compressed_size = actual_tile_size;
-          data_to_write = tile_buffer.data();
-#endif
-          break;
-
-        case COMPRESSION_B44:
-          if (!CompressB44V2(tile_buffer.data(), actual_tile_size,
-                             compress_buffer, actual_w, actual_h,
-                             static_cast<int>(sorted_channels.size()),
-                             sorted_channels.data(), false)) {
-            compressed_size = actual_tile_size;
-            data_to_write = tile_buffer.data();
-          } else {
-            compressed_size = compress_buffer.size();
-            data_to_write = compress_buffer.data();
-          }
-          break;
-
-        case COMPRESSION_B44A:
-          if (!CompressB44V2(tile_buffer.data(), actual_tile_size,
-                             compress_buffer, actual_w, actual_h,
-                             static_cast<int>(sorted_channels.size()),
-                             sorted_channels.data(), true)) {
-            compressed_size = actual_tile_size;
-            data_to_write = tile_buffer.data();
-          } else {
-            compressed_size = compress_buffer.size();
-            data_to_write = compress_buffer.data();
-          }
-          break;
-
-        default:
-          compressed_size = actual_tile_size;
-          data_to_write = tile_buffer.data();
-          break;
+        }
       }
+    }
+  } else if (tile_level_mode == TILE_RIPMAP_LEVELS) {
+    // Ripmap levels - generate on-the-fly since we need independent X/Y downsampling
+    // For now, generate each level's data and write tiles
+    for (int ly = 0; ly < num_y_levels; ly++) {
+      for (int lx = 0; lx < num_x_levels; lx++) {
+        int idx = ly * num_x_levels + lx;
+        int level_w = tiles_per_level[idx][2];
+        int level_h = tiles_per_level[idx][3];
+        int num_x = tiles_per_level[idx][0];
+        int num_y = tiles_per_level[idx][1];
 
-      // Write data size
-      if (!writer.write4(static_cast<uint32_t>(compressed_size))) {
-        return Result<std::vector<uint8_t>>::error(writer.last_error());
-      }
+        // Generate ripmap level data (simplified: box filter downsample)
+        std::vector<float> level_data(static_cast<size_t>(level_w) * level_h * 4);
+        for (int y = 0; y < level_h; y++) {
+          for (int x = 0; x < level_w; x++) {
+            // Map from level coords to base coords
+            float src_x = static_cast<float>(x) * width / level_w;
+            float src_y = static_cast<float>(y) * height / level_h;
+            int sx = static_cast<int>(src_x);
+            int sy = static_cast<int>(src_y);
+            sx = std::min(sx, width - 1);
+            sy = std::min(sy, height - 1);
 
-      // Write compressed data
-      if (!writer.write(compressed_size, data_to_write)) {
-        return Result<std::vector<uint8_t>>::error(writer.last_error());
+            for (int c = 0; c < 4; c++) {
+              level_data[(y * level_w + x) * 4 + c] = image.rgba[(sy * width + sx) * 4 + c];
+            }
+          }
+        }
+
+        for (int ty = 0; ty < num_y; ty++) {
+          for (int tx = 0; tx < num_x; tx++) {
+            offsets.push_back(writer.tell());
+            if (!WriteTile(writer, level_data.data(), level_w, level_h,
+                           tx, ty, tile_w, tile_h, lx, ly,
+                           sorted_channels, header.compression, compression_level,
+                           tile_buffer, reorder_buffer, compress_buffer)) {
+              return Result<std::vector<uint8_t>>::error(
+                ErrorInfo(ErrorCode::CompressionError,
+                          "Failed to write ripmap tile",
+                          "SaveTiledToMemory", writer.tell()));
+            }
+          }
+        }
       }
     }
   }
@@ -3768,7 +3938,7 @@ Result<std::vector<uint8_t>> SaveTiledToMemory(const ImageData& image, int compr
   if (!writer.seek(offset_table_pos)) {
     return Result<std::vector<uint8_t>>::error(writer.last_error());
   }
-  for (int i = 0; i < total_tiles; i++) {
+  for (size_t i = 0; i < offsets.size(); i++) {
     if (!writer.write8(offsets[i])) {
       return Result<std::vector<uint8_t>>::error(writer.last_error());
     }
@@ -3777,6 +3947,14 @@ Result<std::vector<uint8_t>> SaveTiledToMemory(const ImageData& image, int compr
 
   // Return data
   Result<std::vector<uint8_t>> result = Result<std::vector<uint8_t>>::ok(writer.data());
+
+  // Add info about mipmap levels if generated
+  if (tile_level_mode == TILE_MIPMAP_LEVELS && num_x_levels > 1) {
+    result.add_warning("Generated " + std::to_string(num_x_levels) + " mipmap levels");
+  } else if (tile_level_mode == TILE_RIPMAP_LEVELS) {
+    result.add_warning("Generated " + std::to_string(num_x_levels) + "x" +
+                       std::to_string(num_y_levels) + " ripmap levels");
+  }
 
   // Carry forward warnings
   for (size_t i = 0; i < version_result.warnings.size(); i++) {

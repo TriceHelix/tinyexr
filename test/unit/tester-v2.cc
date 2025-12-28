@@ -1425,3 +1425,100 @@ TEST_CASE("v2: Tiled EXR writing with various compressions", "[Tiled][Compressio
     test_compression(tinyexr::v2::COMPRESSION_B44, "Tiled B44", 0.05f);  // Lossy
   }
 }
+
+TEST_CASE("v2: Tiled EXR with mipmap levels", "[Tiled][Mipmap][RoundTrip]") {
+  // Create test image data (64x64 for clean mipmap levels)
+  const int width = 64;
+  const int height = 64;
+
+  tinyexr::v2::ImageData original;
+  original.width = width;
+  original.height = height;
+  original.num_channels = 4;
+  original.rgba.resize(width * height * 4);
+
+  // Fill with gradient pattern
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      int idx = (y * width + x) * 4;
+      original.rgba[idx + 0] = static_cast<float>(x) / width;
+      original.rgba[idx + 1] = static_cast<float>(y) / height;
+      original.rgba[idx + 2] = 0.5f;
+      original.rgba[idx + 3] = 1.0f;
+    }
+  }
+
+  // Set up header for tiled format with mipmap levels
+  original.header.compression = tinyexr::v2::COMPRESSION_ZIP;
+  original.header.data_window.min_x = 0;
+  original.header.data_window.min_y = 0;
+  original.header.data_window.max_x = width - 1;
+  original.header.data_window.max_y = height - 1;
+  original.header.display_window = original.header.data_window;
+  original.header.pixel_aspect_ratio = 1.0f;
+  original.header.screen_window_width = 1.0f;
+  original.header.line_order = 0;
+  original.header.tiled = true;
+  original.header.tile_size_x = 32;
+  original.header.tile_size_y = 32;
+  original.header.tile_level_mode = 1;  // MIPMAP_LEVELS
+  original.header.tile_rounding_mode = 0;
+
+  tinyexr::v2::Channel ch_r, ch_g, ch_b, ch_a;
+  ch_r.name = "R"; ch_r.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_r.x_sampling = 1; ch_r.y_sampling = 1;
+  ch_g.name = "G"; ch_g.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_g.x_sampling = 1; ch_g.y_sampling = 1;
+  ch_b.name = "B"; ch_b.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_b.x_sampling = 1; ch_b.y_sampling = 1;
+  ch_a.name = "A"; ch_a.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_a.x_sampling = 1; ch_a.y_sampling = 1;
+  original.header.channels.push_back(ch_a);
+  original.header.channels.push_back(ch_b);
+  original.header.channels.push_back(ch_g);
+  original.header.channels.push_back(ch_r);
+
+  SECTION("Save and load tiled mipmap") {
+    auto save_result = tinyexr::v2::SaveTiledToMemory(original, 6);
+
+    if (!save_result.success) {
+      INFO("Save error: " + save_result.error_string());
+    }
+    REQUIRE(save_result.success == true);
+    REQUIRE(save_result.value.size() > 0);
+
+    // Should have warning about mipmap levels generated
+    INFO("Mipmap: Saved " << save_result.value.size() << " bytes");
+    if (!save_result.warnings.empty()) {
+      INFO("Warnings: " << save_result.warnings_string());
+    }
+
+    // Load back - loader reads level 0 by default
+    auto load_result = tinyexr::v2::LoadFromMemory(save_result.value.data(),
+                                                    save_result.value.size());
+
+    if (!load_result.success) {
+      INFO("Load error: " + load_result.error_string());
+    }
+    REQUIRE(load_result.success == true);
+
+    // Base level should match original dimensions
+    REQUIRE(load_result.value.width == original.width);
+    REQUIRE(load_result.value.height == original.height);
+
+    // Verify base level pixels
+    size_t num_pixels = width * height * 4;
+    int diff_count = 0;
+    float max_diff = 0.0f;
+    const float tolerance = 0.002f;
+    for (size_t i = 0; i < num_pixels; i++) {
+      float diff = std::abs(load_result.value.rgba[i] - original.rgba[i]);
+      if (diff > tolerance) {
+        diff_count++;
+        if (diff > max_diff) max_diff = diff;
+      }
+    }
+
+    if (diff_count > 0) {
+      INFO("Mipmap: Pixels differing: " << diff_count << ", max diff: " << max_diff);
+    }
+
+    REQUIRE(diff_count == 0);
+  }
+}
