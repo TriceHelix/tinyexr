@@ -47,10 +47,13 @@ Current status of `tinyexr` is:
   - [x] ZIPS
   - [x] PIZ
   - [x] ZFP (tinyexr extension)
-  - [ ] B44?
-  - [ ] B44A?
-  - [ ] PIX24?
+  - [x] B44/B44A (V2 API)
+  - [x] PXR24 (V2 API)
   - [ ] DWA (not planned, patent encumbered)
+- Spectral EXR (JCGT 2021)
+  - [x] Emissive spectra (S{n}.{wavelength}nm)
+  - [x] Reflective spectra (T.{wavelength}nm)
+  - [x] Polarised spectra (Stokes S0-S3)
 - Line order.
   - [x] Increasing, decreasing (load)
   - [ ] Random?
@@ -131,6 +134,7 @@ Current status of `tinyexr` is:
 * [examples/exr2fptiff/](examples/exr2fptiff) EXR to 32bit floating point TIFF converter
   * for 32bit floating point TIFF to EXR convert, see https://github.com/syoyo/tinydngloader/tree/release/examples/fptiff2exr
 * [examples/cube2longlat/](examples/cube2longlat) Cubemap to longlat (equirectangler) converter
+* [examples/spectral/](examples/spectral) Spectral EXR read/write example
 
 ## Experimental
 
@@ -498,6 +502,87 @@ And the one of following attributes must exist in EXR, depending on the `zfpComp
 #### Note on ZFP compression.
 
 At least ZFP code itself works well on big endian machine.
+
+### Spectral EXR
+
+TinyEXR supports reading and writing spectral EXR files based on the JCGT 2021 paper:
+https://jcgt.org/published/0010/03/01/
+
+Reference implementation: https://github.com/afichet/spectral-exr
+
+#### Spectrum Types
+
+| Type | Channel Format | Description |
+|------|----------------|-------------|
+| Emissive | `S{stokes}.{wavelength}nm` | Radiance/irradiance spectra (e.g., `S0.550,000000nm`) |
+| Reflective | `T.{wavelength}nm` | Transmittance/reflectance spectra (e.g., `T.550,000000nm`) |
+| Polarised | `S0-S3.{wavelength}nm` | Stokes vector spectra |
+
+Wavelengths use European decimal convention (comma as separator).
+
+#### Spectral API Functions
+
+```cpp
+// Detection
+int IsSpectralEXR(const char* filename);
+int EXRGetSpectrumType(const EXRHeader* header);  // Returns TINYEXR_SPECTRUM_*
+
+// Channel naming
+void EXRSpectralChannelName(char* buffer, size_t size, float wavelength_nm, int stokes);
+void EXRReflectiveChannelName(char* buffer, size_t size, float wavelength_nm);
+float EXRParseSpectralChannelWavelength(const char* channel_name);
+int EXRGetStokesComponent(const char* channel_name);
+
+// Metadata
+int EXRSetSpectralAttributes(EXRHeader* header, int spectrum_type, const char* units);
+const char* EXRGetSpectralUnits(const EXRHeader* header);
+int EXRGetWavelengths(const EXRHeader* header, float* wavelengths, int max);
+```
+
+See `examples/spectral/` for a complete read/write example.
+
+## V2 API (Experimental)
+
+TinyEXR includes an experimental V2 API in separate header files that provides:
+
+- **Modern C++ interface**: `Result<T>` return types, `std::vector`-based data
+- **Enhanced error reporting**: Error stack with context, positions, and human-readable messages
+- **Header-only**: `tinyexr_v2.hh` + `tinyexr_v2_impl.hh`
+- **Safe memory access**: `StreamReader`/`StreamWriter` with bounds checking
+- **All compression formats**: Including PIZ, B44/B44A, PXR24 encoding
+
+### V2 Features
+
+| Feature | V1 API | V2 API |
+|---------|--------|--------|
+| Error handling | Error codes + strings | `Result<T>` with error stack |
+| Memory safety | Manual bounds checking | Automatic bounds checking |
+| Deep images | Load only | Load + Save (scanline & tiled) |
+| Spectral EXR | Full support | Full support |
+| Tiled writing | Basic | Full (mipmap/ripmap) |
+| Custom attributes | Basic | Full read/write API |
+
+### V2 Quick Example
+
+```cpp
+#include "tinyexr_v2.hh"
+#include "tinyexr_v2_impl.hh"
+
+using namespace tinyexr::v2;
+
+// Load
+auto result = LoadFromFile("input.exr");
+if (!result.success) {
+    printf("Error: %s\n", result.error_string().c_str());
+    return 1;
+}
+ImageData& image = result.value;
+
+// Save
+auto save_result = SaveToFile("output.exr", image);
+```
+
+**Note**: V2 API is experimental and subject to change. V1 API remains stable and recommended for production use.
 
 ## Unit tests
 
