@@ -71,7 +71,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -82,8 +82,8 @@ jobs:
         working-directory: test/unit
         shell: cmd
         run: |
-          cl /EHsc /O2 /I..\..\deps\miniz /c ..\..\deps\miniz\miniz.c
-          cl /EHsc /O2 /std:c++14 /I..\.. /I..\..\deps\miniz tester.cc miniz.obj /Fe:tester.exe
+          cl.exe /EHsc /O2 /I..\..\deps\miniz /c ..\..\deps\miniz\miniz.c
+          cl.exe /EHsc /O2 /std:c++14 /I..\.. /I..\..\deps\miniz tester.cc miniz.obj /Fe:tester.exe
           tester.exe "[spectral],[fuzzing]"
-          cl /EHsc /O2 /std:c++14 /I..\.. /I..\..\deps\miniz tester-v2.cc miniz.obj /Fe:tester-v2.exe
+          cl.exe /EHsc /O2 /std:c++14 /I..\.. /I..\..\deps\miniz tester-v2.cc miniz.obj /Fe:tester-v2.exe
           tester-v2.exe "~[PIZ]"
