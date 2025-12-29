@@ -225,6 +225,12 @@ extern "C" {
 #define TINYEXR_TILE_ROUND_DOWN (0)
 #define TINYEXR_TILE_ROUND_UP (1)
 
+// Spectral EXR types (based on JCGT 2021 paper and spectral-exr format)
+// https://jcgt.org/published/0010/03/01/
+#define TINYEXR_SPECTRUM_REFLECTIVE (0)   // T.{wavelength}nm channels
+#define TINYEXR_SPECTRUM_EMISSIVE (1)     // S0.{wavelength}nm channels
+#define TINYEXR_SPECTRUM_POLARISED (2)    // S0-S3.{wavelength}nm channels
+
 typedef struct TEXRVersion {
   int version;    // this must be 2
   // tile format image;
@@ -633,6 +639,61 @@ extern int LoadEXRFromMemory(float **out_rgba, int *width, int *height,
                              const unsigned char *memory, size_t size,
                              const char **err);
 
+// Spectral EXR API (based on JCGT 2021 paper and spectral-exr format)
+// https://jcgt.org/published/0010/03/01/
+// https://github.com/afichet/spectral-exr
+
+// Check if an EXR file contains spectral data (has spectralLayoutVersion attribute)
+// Returns TINYEXR_SUCCESS if spectral, TINYEXR_ERROR_INVALID_DATA if not
+extern int IsSpectralEXR(const char *filename);
+extern int IsSpectralEXRFromMemory(const unsigned char *memory, size_t size);
+
+// Get spectrum type from EXR header (TINYEXR_SPECTRUM_REFLECTIVE/EMISSIVE/POLARISED)
+// Returns spectrum type, or -1 if not a spectral EXR
+extern int EXRGetSpectrumType(const EXRHeader *exr_header);
+
+// Format wavelength with European decimal convention (comma as separator)
+// Output format: "550,000000" for 550.0nm
+// buffer must be at least 32 bytes
+extern void EXRFormatWavelength(char *buffer, size_t buffer_size, float wavelength_nm);
+
+// Create spectral channel name
+// For emissive: "S{stokes}.{wavelength}nm" (e.g., "S0.550,000000nm")
+// For reflective: "T.{wavelength}nm" (e.g., "T.550,000000nm")
+// buffer must be at least 64 bytes
+extern void EXRSpectralChannelName(char *buffer, size_t buffer_size,
+                                   float wavelength_nm, int stokes_component);
+extern void EXRReflectiveChannelName(char *buffer, size_t buffer_size,
+                                     float wavelength_nm);
+
+// Parse wavelength from spectral channel name
+// Returns wavelength in nm, or -1.0 if not a valid spectral channel name
+extern float EXRParseSpectralChannelWavelength(const char *channel_name);
+
+// Get Stokes component from channel name (0-3, or -1 if not polarised/invalid)
+extern int EXRGetStokesComponent(const char *channel_name);
+
+// Check if channel name is a spectral channel (S{n}.{wavelength}nm or T.{wavelength}nm)
+extern int EXRIsSpectralChannel(const char *channel_name);
+
+// Get wavelengths from EXR header channels
+// Returns number of unique wavelengths found
+// wavelengths array must be pre-allocated, max_wavelengths is its size
+extern int EXRGetWavelengths(const EXRHeader *exr_header,
+                             float *wavelengths, int max_wavelengths);
+
+// Helper to add spectral attributes to an EXRHeader
+// This sets spectralLayoutVersion and ROOT/units (or emissiveUnits for emissive)
+// spectrum_type: TINYEXR_SPECTRUM_REFLECTIVE, EMISSIVE, or POLARISED
+// units: unit string (e.g., "W.m^-2.sr^-1.nm^-1" for radiance)
+extern int EXRSetSpectralAttributes(EXRHeader *exr_header,
+                                    int spectrum_type,
+                                    const char *units);
+
+// Get spectral units from EXR header
+// Returns NULL if not found, otherwise pointer to units string (valid until header is freed)
+extern const char* EXRGetSpectralUnits(const EXRHeader *exr_header);
+
 #ifdef __cplusplus
 }
 #endif
@@ -677,6 +738,9 @@ extern int LoadEXRFromMemory(float **out_rgba, int *width, int *height,
 #include <string>
 #include <vector>
 #include <set>
+
+// Include Reader class with error stack for safer memory reading
+#include "exr_reader.hh"
 
 // https://stackoverflow.com/questions/5047971/how-do-i-check-for-c11-support
 #if __cplusplus > 199711L || (defined(_MSC_VER) && _MSC_VER >= 1900)
@@ -8847,6 +8911,71 @@ int ParseEXRMultipartHeaderFromFile(EXRHeader ***exr_headers, int *num_headers,
       exr_headers, num_headers, exr_version, file.data, file.size, err);
 }
 
+// ========================================================================
+// Refactored loader functions using Reader class for safer memory access
+// ========================================================================
+
+namespace {  // anonymous namespace for internal helpers
+
+// Parse EXR version header using Reader class
+static int ParseEXRVersionWithReader(EXRVersion *version, tinyexr::Reader& reader) {
+  if (version == NULL) {
+    return TINYEXR_ERROR_INVALID_ARGUMENT;
+  }
+
+  if (reader.length() < tinyexr::kEXRVersionSize) {
+    reader.add_error("Insufficient data size for EXR version header");
+    return TINYEXR_ERROR_INVALID_DATA;
+  }
+
+  // Check magic number: 0x76, 0x2f, 0x31, 0x01
+  uint8_t header[4];
+  if (!reader.read(4, header)) {
+    return TINYEXR_ERROR_INVALID_DATA;
+  }
+
+  const uint8_t expected_header[] = {0x76, 0x2f, 0x31, 0x01};
+  if (header[0] != expected_header[0] || header[1] != expected_header[1] ||
+      header[2] != expected_header[2] || header[3] != expected_header[3]) {
+    reader.add_error("Invalid EXR magic number");
+    return TINYEXR_ERROR_INVALID_MAGIC_NUMBER;
+  }
+
+  // Parse version byte (must be 2)
+  uint8_t version_byte;
+  if (!reader.read1(&version_byte)) {
+    return TINYEXR_ERROR_INVALID_DATA;
+  }
+
+  if (version_byte != 2) {
+    reader.add_error("Invalid EXR version");
+    return TINYEXR_ERROR_INVALID_EXR_VERSION;
+  }
+
+  version->version = 2;
+
+  // Parse flags byte
+  uint8_t flags;
+  if (!reader.read1(&flags)) {
+    return TINYEXR_ERROR_INVALID_DATA;
+  }
+
+  version->tiled = (flags & 0x2) ? true : false;       // 9th bit
+  version->long_name = (flags & 0x4) ? true : false;   // 10th bit
+  version->non_image = (flags & 0x8) ? true : false;   // 11th bit (deep image)
+  version->multipart = (flags & 0x10) ? true : false;  // 12th bit
+
+  // Skip remaining 2 bytes to complete the 8-byte version header
+  uint8_t dummy[2];
+  if (!reader.read(2, dummy)) {
+    return TINYEXR_ERROR_INVALID_DATA;
+  }
+
+  return TINYEXR_SUCCESS;
+}
+
+}  // anonymous namespace
+
 int ParseEXRVersionFromMemory(EXRVersion *version, const unsigned char *memory,
                               size_t size) {
   if (version == NULL || memory == NULL) {
@@ -8857,51 +8986,13 @@ int ParseEXRVersionFromMemory(EXRVersion *version, const unsigned char *memory,
     return TINYEXR_ERROR_INVALID_DATA;
   }
 
-  const unsigned char *marker = memory;
+  // Use Reader class for safer memory access
+  tinyexr::Reader reader(memory, size, tinyexr::Endian::Little);
+  int ret = ParseEXRVersionWithReader(version, reader);
 
-  // Header check.
-  {
-    const char header[] = {0x76, 0x2f, 0x31, 0x01};
-
-    if (memcmp(marker, header, 4) != 0) {
-      return TINYEXR_ERROR_INVALID_MAGIC_NUMBER;
-    }
-    marker += 4;
-  }
-
-  version->tiled = false;
-  version->long_name = false;
-  version->non_image = false;
-  version->multipart = false;
-
-  // Parse version header.
-  {
-    // must be 2
-    if (marker[0] != 2) {
-      return TINYEXR_ERROR_INVALID_EXR_VERSION;
-    }
-
-    if (version == NULL) {
-      return TINYEXR_SUCCESS;  // May OK
-    }
-
-    version->version = 2;
-
-    if (marker[1] & 0x2) {  // 9th bit
-      version->tiled = true;
-    }
-    if (marker[1] & 0x4) {  // 10th bit
-      version->long_name = true;
-    }
-    if (marker[1] & 0x8) {        // 11th bit
-      version->non_image = true;  // (deep image)
-    }
-    if (marker[1] & 0x10) {  // 12th bit
-      version->multipart = true;
-    }
-  }
-
-  return TINYEXR_SUCCESS;
+  // Note: errors are accumulated in reader.errors() but not propagated
+  // to maintain compatibility with existing API
+  return ret;
 }
 
 int ParseEXRVersionFromFile(EXRVersion *version, const char *filename) {
@@ -9392,6 +9483,394 @@ int SaveEXR(const float *data, int width, int height, int components,
   free(header.requested_pixel_types);
 
   return ret;
+}
+
+// ----------------------------------------------------------------
+// Spectral EXR API implementations
+// ----------------------------------------------------------------
+
+// Helper to format wavelength with comma as decimal separator (European convention)
+void EXRFormatWavelength(char *buffer, size_t buffer_size, float wavelength_nm) {
+  if (!buffer || buffer_size < 16) return;
+
+  // Format with 6 decimal places
+  int whole = static_cast<int>(wavelength_nm);
+  int frac = static_cast<int>((wavelength_nm - whole) * 1000000.0f + 0.5f);
+
+#ifdef _MSC_VER
+  sprintf_s(buffer, buffer_size, "%d,%06d", whole, frac);
+#else
+  snprintf(buffer, buffer_size, "%d,%06d", whole, frac);
+#endif
+}
+
+// Create spectral channel name for emissive spectrum
+void EXRSpectralChannelName(char *buffer, size_t buffer_size,
+                            float wavelength_nm, int stokes_component) {
+  if (!buffer || buffer_size < 32) return;
+
+  char wavelength_str[32];
+  EXRFormatWavelength(wavelength_str, sizeof(wavelength_str), wavelength_nm);
+
+#ifdef _MSC_VER
+  sprintf_s(buffer, buffer_size, "S%d.%snm", stokes_component, wavelength_str);
+#else
+  snprintf(buffer, buffer_size, "S%d.%snm", stokes_component, wavelength_str);
+#endif
+}
+
+// Create spectral channel name for reflective spectrum
+void EXRReflectiveChannelName(char *buffer, size_t buffer_size,
+                              float wavelength_nm) {
+  if (!buffer || buffer_size < 32) return;
+
+  char wavelength_str[32];
+  EXRFormatWavelength(wavelength_str, sizeof(wavelength_str), wavelength_nm);
+
+#ifdef _MSC_VER
+  sprintf_s(buffer, buffer_size, "T.%snm", wavelength_str);
+#else
+  snprintf(buffer, buffer_size, "T.%snm", wavelength_str);
+#endif
+}
+
+// Parse wavelength from spectral channel name
+float EXRParseSpectralChannelWavelength(const char *channel_name) {
+  if (!channel_name) return -1.0f;
+
+  const char *p = channel_name;
+
+  // Skip prefix: "S{n}." or "T."
+  if (*p == 'S' && p[1] >= '0' && p[1] <= '3' && p[2] == '.') {
+    p += 3;
+  } else if (*p == 'T' && p[1] == '.') {
+    p += 2;
+  } else {
+    return -1.0f;
+  }
+
+  // Parse wavelength with comma as decimal separator
+  // Format: "550,000000nm"
+  char wavelength_str[64];
+  size_t len = 0;
+  while (*p && *p != 'n' && len < sizeof(wavelength_str) - 1) {
+    wavelength_str[len++] = (*p == ',') ? '.' : *p;
+    p++;
+  }
+  wavelength_str[len] = '\0';
+
+  // Check for "nm" suffix
+  if (*p != 'n' || p[1] != 'm') {
+    return -1.0f;
+  }
+
+  return static_cast<float>(atof(wavelength_str));
+}
+
+// Get Stokes component from channel name
+int EXRGetStokesComponent(const char *channel_name) {
+  if (!channel_name) return -1;
+
+  if (channel_name[0] == 'S' &&
+      channel_name[1] >= '0' && channel_name[1] <= '3' &&
+      channel_name[2] == '.') {
+    return channel_name[1] - '0';
+  }
+
+  return -1;
+}
+
+// Check if channel name is a spectral channel
+int EXRIsSpectralChannel(const char *channel_name) {
+  if (!channel_name) return 0;
+
+  // Check for "S{n}.{wavelength}nm" pattern
+  if (channel_name[0] == 'S' &&
+      channel_name[1] >= '0' && channel_name[1] <= '3' &&
+      channel_name[2] == '.') {
+    return EXRParseSpectralChannelWavelength(channel_name) > 0.0f ? 1 : 0;
+  }
+
+  // Check for "T.{wavelength}nm" pattern
+  if (channel_name[0] == 'T' && channel_name[1] == '.') {
+    return EXRParseSpectralChannelWavelength(channel_name) > 0.0f ? 1 : 0;
+  }
+
+  return 0;
+}
+
+// Helper to find custom attribute by name
+static const EXRAttribute* FindCustomAttribute(const EXRHeader *exr_header,
+                                                const char *name) {
+  if (!exr_header || !name) return NULL;
+
+  for (int i = 0; i < exr_header->num_custom_attributes; i++) {
+    if (strcmp(exr_header->custom_attributes[i].name, name) == 0) {
+      return &exr_header->custom_attributes[i];
+    }
+  }
+  return NULL;
+}
+
+// Get spectrum type from EXR header
+int EXRGetSpectrumType(const EXRHeader *exr_header) {
+  if (!exr_header) return -1;
+
+  // Check for spectralLayoutVersion attribute
+  const EXRAttribute *layout_attr = FindCustomAttribute(exr_header, "spectralLayoutVersion");
+  if (!layout_attr) return -1;
+
+  // Check channel names to determine type
+  int has_stokes = 0;
+  int has_reflective = 0;
+  int has_emissive = 0;
+
+  for (int i = 0; i < exr_header->num_channels; i++) {
+    const char *name = exr_header->channels[i].name;
+    if (name[0] == 'T' && name[1] == '.') {
+      has_reflective = 1;
+    } else if (name[0] == 'S' && name[1] >= '0' && name[1] <= '3' && name[2] == '.') {
+      has_emissive = 1;
+      if (name[1] != '0') {
+        has_stokes = 1;
+      }
+    }
+  }
+
+  if (has_reflective) return TINYEXR_SPECTRUM_REFLECTIVE;
+  if (has_stokes) return TINYEXR_SPECTRUM_POLARISED;
+  if (has_emissive) return TINYEXR_SPECTRUM_EMISSIVE;
+
+  return -1;
+}
+
+// Get wavelengths from EXR header channels
+int EXRGetWavelengths(const EXRHeader *exr_header,
+                      float *wavelengths, int max_wavelengths) {
+  if (!exr_header || !wavelengths || max_wavelengths <= 0) return 0;
+
+  int count = 0;
+
+  for (int i = 0; i < exr_header->num_channels && count < max_wavelengths; i++) {
+    float wl = EXRParseSpectralChannelWavelength(exr_header->channels[i].name);
+    if (wl > 0.0f) {
+      // Check if wavelength already in list
+      int found = 0;
+      for (int j = 0; j < count; j++) {
+        if (fabsf(wavelengths[j] - wl) < 0.01f) {
+          found = 1;
+          break;
+        }
+      }
+      if (!found) {
+        wavelengths[count++] = wl;
+      }
+    }
+  }
+
+  // Sort wavelengths
+  for (int i = 0; i < count - 1; i++) {
+    for (int j = i + 1; j < count; j++) {
+      if (wavelengths[i] > wavelengths[j]) {
+        float tmp = wavelengths[i];
+        wavelengths[i] = wavelengths[j];
+        wavelengths[j] = tmp;
+      }
+    }
+  }
+
+  return count;
+}
+
+// Get spectral units from EXR header
+const char* EXRGetSpectralUnits(const EXRHeader *exr_header) {
+  if (!exr_header) return NULL;
+
+  // Try ROOT/units first (spectral-exr format)
+  const EXRAttribute *attr = FindCustomAttribute(exr_header, "ROOT/units");
+  if (attr && attr->value && attr->size > 0) {
+    return reinterpret_cast<const char*>(attr->value);
+  }
+
+  // Try emissiveUnits
+  attr = FindCustomAttribute(exr_header, "emissiveUnits");
+  if (attr && attr->value && attr->size > 0) {
+    return reinterpret_cast<const char*>(attr->value);
+  }
+
+  return NULL;
+}
+
+// Helper to add a string attribute
+static int AddStringAttribute(EXRHeader *exr_header, const char *name, const char *value) {
+  if (!exr_header || !name || !value) return TINYEXR_ERROR_INVALID_ARGUMENT;
+
+  int new_count = exr_header->num_custom_attributes + 1;
+  if (new_count > TINYEXR_MAX_CUSTOM_ATTRIBUTES) {
+    return TINYEXR_ERROR_DATA_TOO_LARGE;
+  }
+
+  // Reallocate attributes array
+  EXRAttribute *new_attrs = static_cast<EXRAttribute*>(
+      realloc(exr_header->custom_attributes,
+              sizeof(EXRAttribute) * static_cast<size_t>(new_count)));
+  if (!new_attrs) {
+    return TINYEXR_ERROR_INVALID_DATA;
+  }
+
+  exr_header->custom_attributes = new_attrs;
+  EXRAttribute *attr = &exr_header->custom_attributes[exr_header->num_custom_attributes];
+
+  // Initialize the new attribute
+  memset(attr, 0, sizeof(EXRAttribute));
+
+#ifdef _MSC_VER
+  strncpy_s(attr->name, sizeof(attr->name), name, 255);
+  strncpy_s(attr->type, sizeof(attr->type), "string", 255);
+#else
+  strncpy(attr->name, name, 255);
+  attr->name[255] = '\0';
+  strncpy(attr->type, "string", 255);
+  attr->type[255] = '\0';
+#endif
+
+  size_t value_len = strlen(value) + 1;  // Include null terminator
+  attr->value = static_cast<unsigned char*>(malloc(value_len));
+  if (!attr->value) {
+    return TINYEXR_ERROR_INVALID_DATA;
+  }
+  memcpy(attr->value, value, value_len);
+  attr->size = static_cast<int>(value_len);
+
+  exr_header->num_custom_attributes = new_count;
+
+  return TINYEXR_SUCCESS;
+}
+
+// Helper to add an int attribute
+static int AddIntAttribute(EXRHeader *exr_header, const char *name, int value) {
+  if (!exr_header || !name) return TINYEXR_ERROR_INVALID_ARGUMENT;
+
+  int new_count = exr_header->num_custom_attributes + 1;
+  if (new_count > TINYEXR_MAX_CUSTOM_ATTRIBUTES) {
+    return TINYEXR_ERROR_DATA_TOO_LARGE;
+  }
+
+  // Reallocate attributes array
+  EXRAttribute *new_attrs = static_cast<EXRAttribute*>(
+      realloc(exr_header->custom_attributes,
+              sizeof(EXRAttribute) * static_cast<size_t>(new_count)));
+  if (!new_attrs) {
+    return TINYEXR_ERROR_INVALID_DATA;
+  }
+
+  exr_header->custom_attributes = new_attrs;
+  EXRAttribute *attr = &exr_header->custom_attributes[exr_header->num_custom_attributes];
+
+  // Initialize the new attribute
+  memset(attr, 0, sizeof(EXRAttribute));
+
+#ifdef _MSC_VER
+  strncpy_s(attr->name, sizeof(attr->name), name, 255);
+  strncpy_s(attr->type, sizeof(attr->type), "int", 255);
+#else
+  strncpy(attr->name, name, 255);
+  attr->name[255] = '\0';
+  strncpy(attr->type, "int", 255);
+  attr->type[255] = '\0';
+#endif
+
+  attr->value = static_cast<unsigned char*>(malloc(sizeof(int)));
+  if (!attr->value) {
+    return TINYEXR_ERROR_INVALID_DATA;
+  }
+  memcpy(attr->value, &value, sizeof(int));
+  attr->size = sizeof(int);
+
+  exr_header->num_custom_attributes = new_count;
+
+  return TINYEXR_SUCCESS;
+}
+
+// Set spectral attributes on EXR header
+int EXRSetSpectralAttributes(EXRHeader *exr_header,
+                             int spectrum_type,
+                             const char *units) {
+  if (!exr_header) return TINYEXR_ERROR_INVALID_ARGUMENT;
+
+  int ret;
+
+  // Add spectralLayoutVersion (always "1.0")
+  ret = AddStringAttribute(exr_header, "spectralLayoutVersion", "1.0");
+  if (ret != TINYEXR_SUCCESS) return ret;
+
+  // Add units attribute based on spectrum type
+  if (units && strlen(units) > 0) {
+    if (spectrum_type == TINYEXR_SPECTRUM_REFLECTIVE) {
+      ret = AddStringAttribute(exr_header, "ROOT/units", units);
+    } else {
+      ret = AddStringAttribute(exr_header, "emissiveUnits", units);
+    }
+    if (ret != TINYEXR_SUCCESS) return ret;
+  }
+
+  // Add polarisation handedness for polarised images
+  if (spectrum_type == TINYEXR_SPECTRUM_POLARISED) {
+    ret = AddStringAttribute(exr_header, "polarisationHandedness", "left");
+    if (ret != TINYEXR_SUCCESS) return ret;
+  }
+
+  return TINYEXR_SUCCESS;
+}
+
+// Check if file contains spectral data
+int IsSpectralEXR(const char *filename) {
+  EXRVersion version;
+  int ret = ParseEXRVersionFromFile(&version, filename);
+  if (ret != TINYEXR_SUCCESS) return ret;
+
+  const char *err = NULL;
+  EXRHeader header;
+  InitEXRHeader(&header);
+
+  ret = ParseEXRHeaderFromFile(&header, &version, filename, &err);
+  if (ret != TINYEXR_SUCCESS) {
+    if (err) FreeEXRErrorMessage(err);
+    return ret;
+  }
+
+  // Check for spectralLayoutVersion attribute
+  int is_spectral = (FindCustomAttribute(&header, "spectralLayoutVersion") != NULL);
+
+  FreeEXRHeader(&header);
+
+  return is_spectral ? TINYEXR_SUCCESS : TINYEXR_ERROR_INVALID_DATA;
+}
+
+// Check if memory contains spectral EXR data
+int IsSpectralEXRFromMemory(const unsigned char *memory, size_t size) {
+  if (!memory || size < 8) return TINYEXR_ERROR_INVALID_DATA;
+
+  EXRVersion version;
+  int ret = ParseEXRVersionFromMemory(&version, memory, size);
+  if (ret != TINYEXR_SUCCESS) return ret;
+
+  const char *err = NULL;
+  EXRHeader header;
+  InitEXRHeader(&header);
+
+  ret = ParseEXRHeaderFromMemory(&header, &version, memory, size, &err);
+  if (ret != TINYEXR_SUCCESS) {
+    if (err) FreeEXRErrorMessage(err);
+    return ret;
+  }
+
+  // Check for spectralLayoutVersion attribute
+  int is_spectral = (FindCustomAttribute(&header, "spectralLayoutVersion") != NULL);
+
+  FreeEXRHeader(&header);
+
+  return is_spectral ? TINYEXR_SUCCESS : TINYEXR_ERROR_INVALID_DATA;
 }
 
 #ifdef __clang__

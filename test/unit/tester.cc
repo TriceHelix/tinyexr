@@ -1743,3 +1743,176 @@ TEST_CASE("Regression: Issue194|Piz", "[issue194]") {
   FreeEXRHeader(&header);
   FreeEXRImage(&image);
 }
+
+// ----------------------------------------------------------------
+// Spectral EXR API tests
+// ----------------------------------------------------------------
+
+TEST_CASE("Spectral: Channel naming", "[spectral]") {
+  // Test emissive channel naming
+  char buffer[64];
+  EXRSpectralChannelName(buffer, sizeof(buffer), 550.0f, 0);
+  REQUIRE(std::string(buffer) == "S0.550,000000nm");
+
+  EXRSpectralChannelName(buffer, sizeof(buffer), 400.5f, 1);
+  REQUIRE(std::string(buffer) == "S1.400,500000nm");
+
+  // Test reflective channel naming
+  EXRReflectiveChannelName(buffer, sizeof(buffer), 700.0f);
+  REQUIRE(std::string(buffer) == "T.700,000000nm");
+
+  // Test wavelength parsing
+  float wl = EXRParseSpectralChannelWavelength("S0.550,000000nm");
+  REQUIRE(wl == Approx(550.0f).epsilon(0.01f));
+
+  wl = EXRParseSpectralChannelWavelength("T.400,500000nm");
+  REQUIRE(wl == Approx(400.5f).epsilon(0.01f));
+
+  // Invalid channel names should return -1
+  wl = EXRParseSpectralChannelWavelength("R");
+  REQUIRE(wl < 0.0f);
+
+  wl = EXRParseSpectralChannelWavelength("InvalidChannel");
+  REQUIRE(wl < 0.0f);
+
+  // Test Stokes component extraction
+  REQUIRE(EXRGetStokesComponent("S0.550,000000nm") == 0);
+  REQUIRE(EXRGetStokesComponent("S1.550,000000nm") == 1);
+  REQUIRE(EXRGetStokesComponent("S2.550,000000nm") == 2);
+  REQUIRE(EXRGetStokesComponent("S3.550,000000nm") == 3);
+  REQUIRE(EXRGetStokesComponent("T.550,000000nm") == -1);
+  REQUIRE(EXRGetStokesComponent("R") == -1);
+
+  // Test spectral channel detection
+  REQUIRE(EXRIsSpectralChannel("S0.550,000000nm") == 1);
+  REQUIRE(EXRIsSpectralChannel("T.700,000000nm") == 1);
+  REQUIRE(EXRIsSpectralChannel("R") == 0);
+  REQUIRE(EXRIsSpectralChannel("G") == 0);
+  REQUIRE(EXRIsSpectralChannel("B") == 0);
+}
+
+TEST_CASE("Spectral: Header attributes", "[spectral]") {
+  EXRHeader header;
+  InitEXRHeader(&header);
+
+  // Test setting spectral attributes
+  int ret = EXRSetSpectralAttributes(&header, TINYEXR_SPECTRUM_EMISSIVE,
+                                     "W.m^-2.sr^-1.nm^-1");
+  REQUIRE(TINYEXR_SUCCESS == ret);
+  REQUIRE(header.num_custom_attributes >= 2);
+
+  // Verify spectralLayoutVersion was set
+  bool found_layout = false;
+  bool found_units = false;
+  for (int i = 0; i < header.num_custom_attributes; i++) {
+    if (strcmp(header.custom_attributes[i].name, "spectralLayoutVersion") == 0) {
+      found_layout = true;
+      REQUIRE(strcmp(header.custom_attributes[i].type, "string") == 0);
+    }
+    if (strcmp(header.custom_attributes[i].name, "emissiveUnits") == 0) {
+      found_units = true;
+      REQUIRE(strcmp(header.custom_attributes[i].type, "string") == 0);
+    }
+  }
+  REQUIRE(found_layout);
+  REQUIRE(found_units);
+
+  // Test getting spectral units
+  const char* units = EXRGetSpectralUnits(&header);
+  REQUIRE(units != nullptr);
+  REQUIRE(std::string(units) == "W.m^-2.sr^-1.nm^-1");
+
+  FreeEXRHeader(&header);
+}
+
+TEST_CASE("Spectral: Spectrum type detection", "[spectral]") {
+  EXRHeader header;
+  InitEXRHeader(&header);
+
+  // Set up spectral attributes
+  int ret = EXRSetSpectralAttributes(&header, TINYEXR_SPECTRUM_EMISSIVE, "radiance");
+  REQUIRE(TINYEXR_SUCCESS == ret);
+
+  // Set up emissive channels
+  header.num_channels = 3;
+  header.channels = static_cast<EXRChannelInfo*>(
+      malloc(sizeof(EXRChannelInfo) * header.num_channels));
+
+  strncpy(header.channels[0].name, "S0.400,000000nm", 255);
+  strncpy(header.channels[1].name, "S0.500,000000nm", 255);
+  strncpy(header.channels[2].name, "S0.600,000000nm", 255);
+
+  // Detect spectrum type
+  int spectrum_type = EXRGetSpectrumType(&header);
+  REQUIRE(spectrum_type == TINYEXR_SPECTRUM_EMISSIVE);
+
+  // Get wavelengths
+  float wavelengths[10];
+  int num_wavelengths = EXRGetWavelengths(&header, wavelengths, 10);
+  REQUIRE(num_wavelengths == 3);
+  REQUIRE(wavelengths[0] == Approx(400.0f).epsilon(0.01f));
+  REQUIRE(wavelengths[1] == Approx(500.0f).epsilon(0.01f));
+  REQUIRE(wavelengths[2] == Approx(600.0f).epsilon(0.01f));
+
+  // Note: FreeEXRHeader will free header.channels, so don't free it manually
+  FreeEXRHeader(&header);
+}
+
+TEST_CASE("Spectral: Reflective spectrum type", "[spectral]") {
+  EXRHeader header;
+  InitEXRHeader(&header);
+
+  // Set up spectral attributes
+  int ret = EXRSetSpectralAttributes(&header, TINYEXR_SPECTRUM_REFLECTIVE, "reflectance");
+  REQUIRE(TINYEXR_SUCCESS == ret);
+
+  // Set up reflective channels
+  header.num_channels = 2;
+  header.channels = static_cast<EXRChannelInfo*>(
+      malloc(sizeof(EXRChannelInfo) * header.num_channels));
+
+  strncpy(header.channels[0].name, "T.450,000000nm", 255);
+  strncpy(header.channels[1].name, "T.550,000000nm", 255);
+
+  // Detect spectrum type
+  int spectrum_type = EXRGetSpectrumType(&header);
+  REQUIRE(spectrum_type == TINYEXR_SPECTRUM_REFLECTIVE);
+
+  // Note: FreeEXRHeader will free header.channels, so don't free it manually
+  FreeEXRHeader(&header);
+}
+
+TEST_CASE("Spectral: Polarised spectrum type", "[spectral]") {
+  EXRHeader header;
+  InitEXRHeader(&header);
+
+  // Set up spectral attributes for polarised
+  int ret = EXRSetSpectralAttributes(&header, TINYEXR_SPECTRUM_POLARISED, "stokes");
+  REQUIRE(TINYEXR_SUCCESS == ret);
+
+  // Verify polarisationHandedness was added
+  bool found_handedness = false;
+  for (int i = 0; i < header.num_custom_attributes; i++) {
+    if (strcmp(header.custom_attributes[i].name, "polarisationHandedness") == 0) {
+      found_handedness = true;
+    }
+  }
+  REQUIRE(found_handedness);
+
+  // Set up polarised channels (S0-S3 for one wavelength)
+  header.num_channels = 4;
+  header.channels = static_cast<EXRChannelInfo*>(
+      malloc(sizeof(EXRChannelInfo) * header.num_channels));
+
+  strncpy(header.channels[0].name, "S0.500,000000nm", 255);
+  strncpy(header.channels[1].name, "S1.500,000000nm", 255);
+  strncpy(header.channels[2].name, "S2.500,000000nm", 255);
+  strncpy(header.channels[3].name, "S3.500,000000nm", 255);
+
+  // Detect spectrum type
+  int spectrum_type = EXRGetSpectrumType(&header);
+  REQUIRE(spectrum_type == TINYEXR_SPECTRUM_POLARISED);
+
+  // Note: FreeEXRHeader will free header.channels, so don't free it manually
+  FreeEXRHeader(&header);
+}
