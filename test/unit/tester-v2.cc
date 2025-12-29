@@ -1791,3 +1791,215 @@ TEST_CASE("v2: Deep image with empty pixels", "[Deep][Sparse]") {
     }
   }
 }
+
+// =============================================================================
+// Raw Channel Access Tests (Phase 5)
+// =============================================================================
+
+TEST_CASE("v2: LoadOptions - preserve raw channels (HALF)", "[v2][loadoptions]") {
+  using namespace tinyexr::v2;
+
+  const int width = 4;
+  const int height = 4;
+
+  // Create test image with HALF channels
+  ImageData original;
+  original.width = width;
+  original.height = height;
+  original.num_channels = 4;
+  original.rgba.resize(width * height * 4);
+
+  // Fill with test pattern
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      int idx = (y * width + x) * 4;
+      original.rgba[idx + 0] = static_cast<float>(x) / width;   // R
+      original.rgba[idx + 1] = static_cast<float>(y) / height;  // G
+      original.rgba[idx + 2] = 0.5f;                            // B
+      original.rgba[idx + 3] = 1.0f;                            // A
+    }
+  }
+
+  original.header.compression = tinyexr::v2::COMPRESSION_ZIP;
+  original.header.data_window.min_x = 0;
+  original.header.data_window.min_y = 0;
+  original.header.data_window.max_x = width - 1;
+  original.header.data_window.max_y = height - 1;
+  original.header.display_window = original.header.data_window;
+  original.header.pixel_aspect_ratio = 1.0f;
+  original.header.screen_window_width = 1.0f;
+  original.header.line_order = 0;
+
+  // Set up channels as HALF
+  Channel ch_r, ch_g, ch_b, ch_a;
+  ch_r.name = "R"; ch_r.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_r.x_sampling = 1; ch_r.y_sampling = 1;
+  ch_g.name = "G"; ch_g.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_g.x_sampling = 1; ch_g.y_sampling = 1;
+  ch_b.name = "B"; ch_b.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_b.x_sampling = 1; ch_b.y_sampling = 1;
+  ch_a.name = "A"; ch_a.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_a.x_sampling = 1; ch_a.y_sampling = 1;
+  original.header.channels.push_back(ch_a);  // Alphabetically sorted
+  original.header.channels.push_back(ch_b);
+  original.header.channels.push_back(ch_g);
+  original.header.channels.push_back(ch_r);
+
+  // Save to memory
+  auto save_result = SaveToMemory(original, 6);
+  REQUIRE(save_result.success);
+
+  // Load with raw channel preservation
+  LoadOptions opts;
+  opts.preserve_raw_channels = true;
+  opts.convert_to_rgba = true;
+
+  auto load_result = LoadFromMemory(save_result.value.data(), save_result.value.size(), opts);
+  REQUIRE(load_result.success);
+
+  const auto& img = load_result.value;
+
+  // Check that raw channels were populated
+  REQUIRE(img.raw_channels.size() == 4);
+
+  // Each HALF channel should have width * height * 2 bytes
+  size_t expected_size = static_cast<size_t>(width) * height * 2;
+  for (size_t c = 0; c < 4; c++) {
+    REQUIRE(img.raw_channels[c].size() == expected_size);
+  }
+
+  // Verify that RGBA conversion also worked
+  REQUIRE(img.rgba.size() == static_cast<size_t>(width) * height * 4);
+}
+
+TEST_CASE("v2: LoadOptions - raw channel data verification", "[v2][loadoptions]") {
+  using namespace tinyexr::v2;
+
+  const int width = 4;
+  const int height = 4;
+
+  // Create test image (SaveToMemory converts to HALF internally)
+  ImageData original;
+  original.width = width;
+  original.height = height;
+  original.num_channels = 3;
+  original.rgba.resize(width * height * 4);
+
+  // Fill with test pattern - values that can be represented accurately in HALF
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      int idx = (y * width + x) * 4;
+      original.rgba[idx + 0] = static_cast<float>(x) * 0.25f;  // R: 0, 0.25, 0.5, 0.75
+      original.rgba[idx + 1] = static_cast<float>(y) * 0.25f;  // G: 0, 0.25, 0.5, 0.75
+      original.rgba[idx + 2] = 0.5f;                           // B: constant
+      original.rgba[idx + 3] = 1.0f;                           // A (not saved)
+    }
+  }
+
+  original.header.compression = tinyexr::v2::COMPRESSION_ZIP;
+  original.header.data_window.min_x = 0;
+  original.header.data_window.min_y = 0;
+  original.header.data_window.max_x = width - 1;
+  original.header.data_window.max_y = height - 1;
+  original.header.display_window = original.header.data_window;
+  original.header.pixel_aspect_ratio = 1.0f;
+  original.header.screen_window_width = 1.0f;
+  original.header.line_order = 0;
+
+  // Set up RGB channels as HALF (SaveToMemory writes HALF regardless of input)
+  Channel ch_r, ch_g, ch_b;
+  ch_r.name = "R"; ch_r.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_r.x_sampling = 1; ch_r.y_sampling = 1;
+  ch_g.name = "G"; ch_g.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_g.x_sampling = 1; ch_g.y_sampling = 1;
+  ch_b.name = "B"; ch_b.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_b.x_sampling = 1; ch_b.y_sampling = 1;
+  original.header.channels.push_back(ch_b);  // Alphabetically sorted
+  original.header.channels.push_back(ch_g);
+  original.header.channels.push_back(ch_r);
+
+  // Save to memory
+  auto save_result = SaveToMemory(original, 6);
+  REQUIRE(save_result.success);
+
+  // Load with raw channel preservation
+  LoadOptions opts;
+  opts.preserve_raw_channels = true;
+  opts.convert_to_rgba = true;
+
+  auto load_result = LoadFromMemory(save_result.value.data(), save_result.value.size(), opts);
+  REQUIRE(load_result.success);
+
+  const auto& img = load_result.value;
+
+  // Check that raw channels were populated (HALF = 2 bytes per pixel)
+  REQUIRE(img.raw_channels.size() == 3);
+  size_t expected_size = static_cast<size_t>(width) * height * 2;  // HALF format
+  for (size_t c = 0; c < 3; c++) {
+    REQUIRE(img.raw_channels[c].size() == expected_size);
+  }
+
+  // Verify loaded header has correct pixel type
+  REQUIRE(img.header.channels.size() == 3);
+  for (size_t c = 0; c < 3; c++) {
+    REQUIRE(img.header.channels[c].pixel_type == tinyexr::v2::PIXEL_TYPE_HALF);
+  }
+
+  // Verify raw data can be interpreted correctly
+  // Channels are in header order: B, G, R (indices 0, 1, 2)
+  // Check R channel (index 2) - should have values 0, 0.25, 0.5, 0.75 repeating per row
+  const uint8_t* r_raw = img.raw_channels[2].data();
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      size_t offset = (static_cast<size_t>(y) * width + x) * 2;
+      uint16_t half_val;
+      std::memcpy(&half_val, r_raw + offset, 2);
+      float val = tinyexr::v2::HalfToFloat(half_val);
+      float expected = static_cast<float>(x) * 0.25f;
+      REQUIRE(std::abs(val - expected) < 0.001f);
+    }
+  }
+}
+
+TEST_CASE("v2: LoadOptions - default (no raw channels)", "[v2][loadoptions]") {
+  using namespace tinyexr::v2;
+
+  const int width = 4;
+  const int height = 4;
+
+  // Create test image
+  ImageData original;
+  original.width = width;
+  original.height = height;
+  original.num_channels = 4;
+  original.rgba.resize(width * height * 4, 0.5f);
+
+  original.header.compression = tinyexr::v2::COMPRESSION_ZIP;
+  original.header.data_window.min_x = 0;
+  original.header.data_window.min_y = 0;
+  original.header.data_window.max_x = width - 1;
+  original.header.data_window.max_y = height - 1;
+  original.header.display_window = original.header.data_window;
+  original.header.pixel_aspect_ratio = 1.0f;
+  original.header.screen_window_width = 1.0f;
+  original.header.line_order = 0;
+
+  Channel ch_r, ch_g, ch_b, ch_a;
+  ch_r.name = "R"; ch_r.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_r.x_sampling = 1; ch_r.y_sampling = 1;
+  ch_g.name = "G"; ch_g.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_g.x_sampling = 1; ch_g.y_sampling = 1;
+  ch_b.name = "B"; ch_b.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_b.x_sampling = 1; ch_b.y_sampling = 1;
+  ch_a.name = "A"; ch_a.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_a.x_sampling = 1; ch_a.y_sampling = 1;
+  original.header.channels.push_back(ch_a);
+  original.header.channels.push_back(ch_b);
+  original.header.channels.push_back(ch_g);
+  original.header.channels.push_back(ch_r);
+
+  // Save to memory
+  auto save_result = SaveToMemory(original, 6);
+  REQUIRE(save_result.success);
+
+  // Load with default options (no raw channels)
+  auto load_result = LoadFromMemory(save_result.value.data(), save_result.value.size());
+  REQUIRE(load_result.success);
+
+  const auto& img = load_result.value;
+
+  // Raw channels should be empty
+  REQUIRE(img.raw_channels.empty());
+
+  // RGBA should still work
+  REQUIRE(img.rgba.size() == static_cast<size_t>(width) * height * 4);
+}

@@ -1645,7 +1645,15 @@ static Result<ImageData> LoadTiledFromMemory(const uint8_t* data, size_t size,
                                               const Version& version,
                                               const Header& header);
 
+// Forward declaration for LoadOptions version
+Result<ImageData> LoadFromMemory(const uint8_t* data, size_t size, const LoadOptions& opts);
+
 Result<ImageData> LoadFromMemory(const uint8_t* data, size_t size) {
+  // Call the LoadOptions version with default options
+  return LoadFromMemory(data, size, LoadOptions());
+}
+
+Result<ImageData> LoadFromMemory(const uint8_t* data, size_t size, const LoadOptions& opts) {
   if (!data) {
     return Result<ImageData>::error(
       ErrorInfo(ErrorCode::InvalidArgument,
@@ -1799,6 +1807,18 @@ Result<ImageData> LoadFromMemory(const uint8_t* data, size_t size) {
     }
     channel_sizes.push_back(sz);
     bytes_per_pixel += static_cast<size_t>(sz);
+  }
+
+  // Allocate raw channel buffers if requested
+  if (opts.preserve_raw_channels) {
+    img_data.raw_channels.resize(hdr.channels.size());
+    for (size_t c = 0; c < hdr.channels.size(); c++) {
+      // For subsampled channels, the size is reduced
+      int ch_width = width / hdr.channels[c].x_sampling;
+      int ch_height = height / hdr.channels[c].y_sampling;
+      size_t ch_size = static_cast<size_t>(ch_width) * ch_height * channel_sizes[c];
+      img_data.raw_channels[c].resize(ch_size);
+    }
   }
 
   // Calculate scanline data size accounting for subsampling
@@ -2013,6 +2033,51 @@ Result<ImageData> LoadFromMemory(const uint8_t* data, size_t size) {
                                         "Failed to decompress block " + std::to_string(block),
                                         reader.context(), reader.tell()));
       return result;
+    }
+
+    // Copy raw channel data if requested
+    if (opts.preserve_raw_channels) {
+      // Data in decomp_buf is organized per-scanline, with channels grouped within each line:
+      // Line0: [Ch0_allpixels][Ch1_allpixels]...[ChN_allpixels]
+      // Line1: [Ch0_allpixels][Ch1_allpixels]...[ChN_allpixels]
+      // ...
+      // For subsampled channels, only lines where (y % y_sampling == 0) have data
+
+      // Calculate scanline data layout
+      size_t scanline_data_size = 0;
+      std::vector<size_t> ch_scanline_offsets(hdr.channels.size());
+      for (size_t c = 0; c < hdr.channels.size(); c++) {
+        ch_scanline_offsets[c] = scanline_data_size;
+        int ch_width = width / hdr.channels[c].x_sampling;
+        scanline_data_size += static_cast<size_t>(ch_width) * channel_sizes[c];
+      }
+
+      for (int line = 0; line < num_lines; line++) {
+        int y = y_start + line;
+        if (y < 0 || y >= height) continue;
+
+        // For each channel, copy this line's data
+        for (size_t c = 0; c < hdr.channels.size(); c++) {
+          int y_samp = hdr.channels[c].y_sampling;
+          if ((y % y_samp) != 0) continue;
+
+          int ch_pixel_size = channel_sizes[c];
+          int ch_width = width / hdr.channels[c].x_sampling;
+          int ch_height = height / y_samp;
+          size_t ch_line_size = static_cast<size_t>(ch_width) * ch_pixel_size;
+
+          int ch_y = y / y_samp;
+          size_t dst_offset = static_cast<size_t>(ch_y) * ch_line_size;
+          size_t src_offset = static_cast<size_t>(line) * scanline_data_size + ch_scanline_offsets[c];
+
+          if (ch_y < ch_height && dst_offset + ch_line_size <= img_data.raw_channels[c].size() &&
+              src_offset + ch_line_size <= decomp_buf.size()) {
+            std::memcpy(img_data.raw_channels[c].data() + dst_offset,
+                        decomp_buf.data() + src_offset,
+                        ch_line_size);
+          }
+        }
+      }
     }
 
     // Convert pixel data to RGBA float
@@ -4333,19 +4398,38 @@ Result<std::vector<uint8_t>> SaveDeepToMemory(const DeepImageData& deep, int com
     uint64_t packed_count_size = unpacked_count_size;
 
     if (header.compression != COMPRESSION_NONE) {
-      // Compress with zlib
-      counts_compressed.resize(compressBound(static_cast<uLong>(unpacked_count_size)));
-      uLongf dest_len = static_cast<uLongf>(counts_compressed.size());
-      int z_result = compress2(counts_compressed.data(), &dest_len,
-                                counts_raw.data(), static_cast<uLong>(unpacked_count_size),
-                                miniz_level);
-      if (z_result == Z_OK && dest_len < unpacked_count_size) {
-        counts_compressed.resize(dest_len);
-        packed_count_size = dest_len;
+      // Compress with zlib (raw deflate, no delta predictor for deep data)
+#if defined(TINYEXR_USE_MINIZ)
+      mz_ulong compressed_size = static_cast<mz_ulong>(unpacked_count_size + unpacked_count_size / 1000 + 128);
+      counts_compressed.resize(compressed_size);
+      int z_result = mz_compress2(counts_compressed.data(), &compressed_size,
+                                  counts_raw.data(), static_cast<mz_ulong>(unpacked_count_size),
+                                  miniz_level);
+      if (z_result == MZ_OK && compressed_size < unpacked_count_size) {
+        counts_compressed.resize(compressed_size);
+        packed_count_size = compressed_size;
       } else {
         counts_compressed = counts_raw;
         packed_count_size = unpacked_count_size;
       }
+#elif defined(TINYEXR_USE_ZLIB)
+      uLongf compressed_size = compressBound(static_cast<uLong>(unpacked_count_size));
+      counts_compressed.resize(compressed_size);
+      int z_result = compress2(counts_compressed.data(), &compressed_size,
+                                counts_raw.data(), static_cast<uLong>(unpacked_count_size),
+                                miniz_level);
+      if (z_result == Z_OK && compressed_size < unpacked_count_size) {
+        counts_compressed.resize(compressed_size);
+        packed_count_size = compressed_size;
+      } else {
+        counts_compressed = counts_raw;
+        packed_count_size = unpacked_count_size;
+      }
+#else
+      // No compression available
+      counts_compressed = counts_raw;
+      packed_count_size = unpacked_count_size;
+#endif
     } else {
       counts_compressed = counts_raw;
     }
@@ -4388,18 +4472,37 @@ Result<std::vector<uint8_t>> SaveDeepToMemory(const DeepImageData& deep, int com
     uint64_t packed_data_size = unpacked_data_size;
 
     if (header.compression != COMPRESSION_NONE && unpacked_data_size > 0) {
-      data_compressed.resize(compressBound(static_cast<uLong>(unpacked_data_size)));
-      uLongf dest_len = static_cast<uLongf>(data_compressed.size());
-      int z_result = compress2(data_compressed.data(), &dest_len,
-                                data_raw.data(), static_cast<uLong>(unpacked_data_size),
-                                miniz_level);
-      if (z_result == Z_OK && dest_len < unpacked_data_size) {
-        data_compressed.resize(dest_len);
-        packed_data_size = dest_len;
+#if defined(TINYEXR_USE_MINIZ)
+      mz_ulong compressed_size = static_cast<mz_ulong>(unpacked_data_size + unpacked_data_size / 1000 + 128);
+      data_compressed.resize(compressed_size);
+      int z_result = mz_compress2(data_compressed.data(), &compressed_size,
+                                  data_raw.data(), static_cast<mz_ulong>(unpacked_data_size),
+                                  miniz_level);
+      if (z_result == MZ_OK && compressed_size < unpacked_data_size) {
+        data_compressed.resize(compressed_size);
+        packed_data_size = compressed_size;
       } else {
         data_compressed = data_raw;
         packed_data_size = unpacked_data_size;
       }
+#elif defined(TINYEXR_USE_ZLIB)
+      uLongf compressed_size = compressBound(static_cast<uLong>(unpacked_data_size));
+      data_compressed.resize(compressed_size);
+      int z_result = compress2(data_compressed.data(), &compressed_size,
+                                data_raw.data(), static_cast<uLong>(unpacked_data_size),
+                                miniz_level);
+      if (z_result == Z_OK && compressed_size < unpacked_data_size) {
+        data_compressed.resize(compressed_size);
+        packed_data_size = compressed_size;
+      } else {
+        data_compressed = data_raw;
+        packed_data_size = unpacked_data_size;
+      }
+#else
+      // No compression available
+      data_compressed = data_raw;
+      packed_data_size = unpacked_data_size;
+#endif
     } else {
       data_compressed = data_raw;
     }
@@ -5065,16 +5168,22 @@ static Result<DeepImageData> LoadDeepScanlinePart(
       }
     } else {
       // Decompress (raw zlib, no delta predictor or reordering for deep data)
-#if TINYEXR_USE_MINIZ
+#if defined(TINYEXR_USE_MINIZ)
       mz_ulong dest_len = static_cast<mz_ulong>(num_block_pixels * 4);
       mz_uncompress(reinterpret_cast<uint8_t*>(sample_counts.data()),
                     &dest_len, count_compressed.data(),
                     static_cast<mz_ulong>(packed_count_size));
-#else
+#elif defined(TINYEXR_USE_ZLIB)
       uLongf dest_len = static_cast<uLongf>(num_block_pixels * 4);
       uncompress(reinterpret_cast<uint8_t*>(sample_counts.data()),
                  &dest_len, count_compressed.data(),
                  static_cast<uLong>(packed_count_size));
+#else
+      // No decompression available - this shouldn't happen
+      return Result<DeepImageData>::error(
+        ErrorInfo(ErrorCode::CompressionError,
+                  "No compression library available for deep sample counts",
+                  reader.context(), reader.tell()));
 #endif
     }
 
@@ -5170,14 +5279,20 @@ static Result<DeepImageData> LoadDeepScanlinePart(
       data_uncompressed = std::move(data_compressed);
     } else {
       // Decompress (raw zlib, no delta predictor or reordering for deep data)
-#if TINYEXR_USE_MINIZ
+#if defined(TINYEXR_USE_MINIZ)
       mz_ulong dest_len = static_cast<mz_ulong>(unpacked_data_size);
       mz_uncompress(data_uncompressed.data(), &dest_len,
                     data_compressed.data(), static_cast<mz_ulong>(packed_data_size));
-#else
+#elif defined(TINYEXR_USE_ZLIB)
       uLongf dest_len = static_cast<uLongf>(unpacked_data_size);
       uncompress(data_uncompressed.data(), &dest_len,
                  data_compressed.data(), static_cast<uLong>(packed_data_size));
+#else
+      // No decompression available - shouldn't happen
+      return Result<DeepImageData>::error(
+        ErrorInfo(ErrorCode::CompressionError,
+                  "No compression library available for deep sample data",
+                  reader.context(), reader.tell()));
 #endif
     }
 

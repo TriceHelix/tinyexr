@@ -731,13 +731,31 @@ Result<Version> ParseVersion(Reader& reader);
 // Parse EXR header (after version)
 Result<Header> ParseHeader(Reader& reader, const Version& version);
 
+// Load options for customizing how EXR files are loaded
+struct LoadOptions {
+  // If true, preserve raw channel data in original format (UINT/HALF/FLOAT bytes)
+  // Default: false (only convert to RGBA float)
+  bool preserve_raw_channels = false;
+
+  // If true, convert pixel data to RGBA float (default behavior)
+  // Default: true
+  bool convert_to_rgba = true;
+
+  LoadOptions() : preserve_raw_channels(false), convert_to_rgba(true) {}
+};
+
 // Load full EXR from memory (simplified API)
 struct ImageData {
   int width;
   int height;
   int num_channels;
-  std::vector<float> rgba;  // Always RGBA float for simplicity in v2
+  std::vector<float> rgba;  // Always RGBA float for simplicity in v2 (when convert_to_rgba=true)
   Header header;
+
+  // Raw channel data (populated when LoadOptions.preserve_raw_channels = true)
+  // raw_channels[channel_index] contains the raw bytes for that channel
+  // The data format depends on the channel's pixel_type in header.channels
+  std::vector<std::vector<uint8_t>> raw_channels;
 
   ImageData() : width(0), height(0), num_channels(0) {}
 };
@@ -786,6 +804,10 @@ struct MultipartImageData {
 };
 
 Result<ImageData> LoadFromMemory(const uint8_t* data, size_t size);
+
+// Load EXR from memory with options
+// Use this when you need to preserve raw channel data or customize loading behavior
+Result<ImageData> LoadFromMemory(const uint8_t* data, size_t size, const LoadOptions& opts);
 
 // Load multipart/deep EXR from memory
 Result<MultipartImageData> LoadMultipartFromMemory(const uint8_t* data, size_t size);
