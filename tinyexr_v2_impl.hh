@@ -4013,6 +4013,471 @@ Result<void> SaveTiledToFile(const char* filename, const ImageData& image, int c
 }
 
 // ============================================================================
+// Deep Image Writing
+// ============================================================================
+
+// Save deep scanline EXR to memory
+Result<std::vector<uint8_t>> SaveDeepToMemory(const DeepImageData& deep, int compression_level) {
+  std::vector<uint8_t> output;
+  std::vector<std::string> warnings;
+
+  // Validate input
+  if (deep.width <= 0 || deep.height <= 0) {
+    return Result<std::vector<uint8_t>>::error(
+      ErrorInfo(ErrorCode::InvalidArgument, "Invalid deep image dimensions",
+                "SaveDeepToMemory", 0));
+  }
+
+  if (deep.sample_counts.size() != static_cast<size_t>(deep.width) * deep.height) {
+    return Result<std::vector<uint8_t>>::error(
+      ErrorInfo(ErrorCode::InvalidArgument,
+                "Sample counts array size mismatch with dimensions",
+                "SaveDeepToMemory", 0));
+  }
+
+  if (deep.header.channels.empty()) {
+    return Result<std::vector<uint8_t>>::error(
+      ErrorInfo(ErrorCode::InvalidArgument, "No channels specified",
+                "SaveDeepToMemory", 0));
+  }
+
+  // Verify total_samples matches sum of sample_counts
+  size_t counted_samples = 0;
+  for (size_t i = 0; i < deep.sample_counts.size(); i++) {
+    counted_samples += deep.sample_counts[i];
+  }
+  if (counted_samples != deep.total_samples) {
+    return Result<std::vector<uint8_t>>::error(
+      ErrorInfo(ErrorCode::InvalidArgument,
+                "total_samples doesn't match sum of sample_counts",
+                "SaveDeepToMemory", 0));
+  }
+
+  // Verify channel_data sizes
+  for (size_t c = 0; c < deep.header.channels.size(); c++) {
+    if (deep.channel_data.size() <= c || deep.channel_data[c].size() != deep.total_samples) {
+      return Result<std::vector<uint8_t>>::error(
+        ErrorInfo(ErrorCode::InvalidArgument,
+                  "Channel data size mismatch for channel " + std::to_string(c),
+                  "SaveDeepToMemory", 0));
+    }
+  }
+
+  int width = deep.width;
+  int height = deep.height;
+
+  // Create header copy with deep-specific settings
+  Header header = deep.header;
+  header.type = "deepscanline";
+  if (header.data_window.max_x == 0 && header.data_window.max_y == 0) {
+    header.data_window.min_x = 0;
+    header.data_window.min_y = 0;
+    header.data_window.max_x = width - 1;
+    header.data_window.max_y = height - 1;
+    header.display_window = header.data_window;
+  }
+  if (header.pixel_aspect_ratio <= 0.0f) {
+    header.pixel_aspect_ratio = 1.0f;
+  }
+  if (header.screen_window_width <= 0.0f) {
+    header.screen_window_width = 1.0f;
+  }
+
+  // Default to ZIP compression for deep if none specified
+  if (header.compression == COMPRESSION_NONE) {
+    header.compression = COMPRESSION_ZIP;
+  }
+  // Deep only supports NONE, RLE, ZIPS, ZIP
+  if (header.compression != COMPRESSION_NONE &&
+      header.compression != COMPRESSION_RLE &&
+      header.compression != COMPRESSION_ZIPS &&
+      header.compression != COMPRESSION_ZIP) {
+    warnings.push_back("Compression type not supported for deep images, using ZIP");
+    header.compression = COMPRESSION_ZIP;
+  }
+
+  // Calculate bytes per sample for each channel
+  std::vector<int> channel_sizes;
+  for (size_t c = 0; c < header.channels.size(); c++) {
+    int sz = 4;  // Default FLOAT
+    switch (header.channels[c].pixel_type) {
+      case PIXEL_TYPE_UINT:  sz = 4; break;
+      case PIXEL_TYPE_HALF:  sz = 2; break;
+      case PIXEL_TYPE_FLOAT: sz = 4; break;
+      default: sz = 4; break;
+    }
+    channel_sizes.push_back(sz);
+  }
+
+  // Create version (deep scanline = non_image flag set)
+  Version version;
+  version.version = 2;
+  version.tiled = false;
+  version.long_name = false;
+  version.non_image = true;  // Deep data flag
+  version.multipart = false;
+
+  // Reserve space for output
+  output.reserve(1024 * 1024);  // 1MB initial
+
+  // Write magic number
+  output.push_back(0x76);
+  output.push_back(0x2f);
+  output.push_back(0x31);
+  output.push_back(0x01);
+
+  // Write version
+  uint32_t version_bits = version.version;
+  if (version.tiled) version_bits |= 0x200;
+  if (version.long_name) version_bits |= 0x400;
+  if (version.non_image) version_bits |= 0x800;
+  if (version.multipart) version_bits |= 0x1000;
+  output.push_back(static_cast<uint8_t>(version_bits & 0xFF));
+  output.push_back(static_cast<uint8_t>((version_bits >> 8) & 0xFF));
+  output.push_back(static_cast<uint8_t>((version_bits >> 16) & 0xFF));
+  output.push_back(static_cast<uint8_t>((version_bits >> 24) & 0xFF));
+
+  // Lambda to write bytes
+  auto write_bytes = [&output](const void* data, size_t len) {
+    const uint8_t* ptr = static_cast<const uint8_t*>(data);
+    output.insert(output.end(), ptr, ptr + len);
+  };
+
+  // Lambda to write null-terminated string
+  auto write_string = [&output](const std::string& s) {
+    output.insert(output.end(), s.begin(), s.end());
+    output.push_back(0);
+  };
+
+  // Lambda to write uint32
+  auto write_u32 = [&output](uint32_t v) {
+    output.push_back(static_cast<uint8_t>(v & 0xFF));
+    output.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+    output.push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
+    output.push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
+  };
+
+  // Lambda to write int32
+  auto write_i32 = [&output](int32_t v) {
+    uint32_t u;
+    std::memcpy(&u, &v, 4);
+    output.push_back(static_cast<uint8_t>(u & 0xFF));
+    output.push_back(static_cast<uint8_t>((u >> 8) & 0xFF));
+    output.push_back(static_cast<uint8_t>((u >> 16) & 0xFF));
+    output.push_back(static_cast<uint8_t>((u >> 24) & 0xFF));
+  };
+
+  // Lambda to write uint64
+  auto write_u64 = [&output](uint64_t v) {
+    for (int i = 0; i < 8; i++) {
+      output.push_back(static_cast<uint8_t>((v >> (i * 8)) & 0xFF));
+    }
+  };
+
+  // Lambda to write float
+  auto write_float = [&output](float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    output.push_back(static_cast<uint8_t>(u & 0xFF));
+    output.push_back(static_cast<uint8_t>((u >> 8) & 0xFF));
+    output.push_back(static_cast<uint8_t>((u >> 16) & 0xFF));
+    output.push_back(static_cast<uint8_t>((u >> 24) & 0xFF));
+  };
+
+  // Lambda to write attribute
+  auto write_attribute = [&](const std::string& name, const std::string& type,
+                              const void* data, size_t size) {
+    write_string(name);
+    write_string(type);
+    write_u32(static_cast<uint32_t>(size));
+    write_bytes(data, size);
+  };
+
+  // Write header attributes
+
+  // channels (chlist)
+  {
+    std::vector<uint8_t> chlist;
+    for (const auto& ch : header.channels) {
+      for (char c : ch.name) chlist.push_back(static_cast<uint8_t>(c));
+      chlist.push_back(0);
+      // pixel type (int32)
+      uint32_t pt = ch.pixel_type;
+      chlist.push_back(static_cast<uint8_t>(pt & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((pt >> 8) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((pt >> 16) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((pt >> 24) & 0xFF));
+      // pLinear (uint8) + 3 padding
+      chlist.push_back(0); chlist.push_back(0);
+      chlist.push_back(0); chlist.push_back(0);
+      // x_sampling (int32)
+      int32_t xs = ch.x_sampling > 0 ? ch.x_sampling : 1;
+      chlist.push_back(static_cast<uint8_t>(xs & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((xs >> 8) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((xs >> 16) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((xs >> 24) & 0xFF));
+      // y_sampling (int32)
+      int32_t ys = ch.y_sampling > 0 ? ch.y_sampling : 1;
+      chlist.push_back(static_cast<uint8_t>(ys & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((ys >> 8) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((ys >> 16) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((ys >> 24) & 0xFF));
+    }
+    chlist.push_back(0);  // terminating null
+    write_attribute("channels", "chlist", chlist.data(), chlist.size());
+  }
+
+  // compression
+  {
+    uint8_t comp = static_cast<uint8_t>(header.compression);
+    write_attribute("compression", "compression", &comp, 1);
+  }
+
+  // dataWindow
+  {
+    int32_t dw[4] = {header.data_window.min_x, header.data_window.min_y,
+                      header.data_window.max_x, header.data_window.max_y};
+    write_attribute("dataWindow", "box2i", dw, 16);
+  }
+
+  // displayWindow
+  {
+    int32_t dw[4] = {header.display_window.min_x, header.display_window.min_y,
+                      header.display_window.max_x, header.display_window.max_y};
+    write_attribute("displayWindow", "box2i", dw, 16);
+  }
+
+  // lineOrder (INCREASING_Y = 0)
+  {
+    uint8_t lo = static_cast<uint8_t>(header.line_order);
+    write_attribute("lineOrder", "lineOrder", &lo, 1);
+  }
+
+  // pixelAspectRatio
+  write_attribute("pixelAspectRatio", "float", &header.pixel_aspect_ratio, 4);
+
+  // screenWindowCenter
+  {
+    float swc[2] = {header.screen_window_center[0], header.screen_window_center[1]};
+    write_attribute("screenWindowCenter", "v2f", swc, 8);
+  }
+
+  // screenWindowWidth
+  write_attribute("screenWindowWidth", "float", &header.screen_window_width, 4);
+
+  // type = "deepscanline"
+  {
+    std::string type = "deepscanline";
+    write_attribute("type", "string", type.c_str(), type.size() + 1);
+  }
+
+  // End of header
+  output.push_back(0);
+
+  // Calculate number of scanline blocks
+  int scanlines_per_block = GetScanlinesPerBlock(header.compression);
+  int num_blocks = (height + scanlines_per_block - 1) / scanlines_per_block;
+
+  // Reserve offset table space
+  size_t offset_table_pos = output.size();
+  for (int i = 0; i < num_blocks; i++) {
+    write_u64(0);  // Placeholder
+  }
+
+  // Get compression parameters
+  int miniz_level = (compression_level < 1) ? 6 : (compression_level > 9) ? 9 : compression_level;
+
+  // Store block offsets
+  std::vector<uint64_t> block_offsets(static_cast<size_t>(num_blocks));
+
+  // Write each scanline block
+  for (int block = 0; block < num_blocks; block++) {
+    block_offsets[static_cast<size_t>(block)] = output.size();
+
+    int block_start_y = block * scanlines_per_block;
+    int block_end_y = std::min(block_start_y + scanlines_per_block, height);
+    int num_lines = block_end_y - block_start_y;
+    size_t num_block_pixels = static_cast<size_t>(width) * num_lines;
+
+    // Y coordinate for this block (in data window coordinates)
+    int32_t y_coord = header.data_window.min_y + block_start_y;
+    write_i32(y_coord);
+
+    // Gather sample counts for this block
+    std::vector<uint32_t> block_counts(num_block_pixels);
+    size_t block_total_samples = 0;
+    size_t sample_start = 0;
+
+    // Calculate sample_start (sum of all samples before this block)
+    for (int y = 0; y < block_start_y; y++) {
+      for (int x = 0; x < width; x++) {
+        sample_start += deep.sample_counts[static_cast<size_t>(y) * width + x];
+      }
+    }
+
+    for (int y = block_start_y; y < block_end_y; y++) {
+      for (int x = 0; x < width; x++) {
+        size_t pixel_idx = static_cast<size_t>(y) * width + x;
+        size_t block_pixel_idx = static_cast<size_t>(y - block_start_y) * width + x;
+        block_counts[block_pixel_idx] = deep.sample_counts[pixel_idx];
+        block_total_samples += deep.sample_counts[pixel_idx];
+      }
+    }
+
+    // Compress sample counts
+    std::vector<uint8_t> counts_raw(num_block_pixels * 4);
+    std::memcpy(counts_raw.data(), block_counts.data(), num_block_pixels * 4);
+
+    std::vector<uint8_t> counts_compressed;
+    uint64_t unpacked_count_size = num_block_pixels * 4;
+    uint64_t packed_count_size = unpacked_count_size;
+
+    if (header.compression != COMPRESSION_NONE) {
+      // Compress with zlib
+      counts_compressed.resize(compressBound(static_cast<uLong>(unpacked_count_size)));
+      uLongf dest_len = static_cast<uLongf>(counts_compressed.size());
+      int z_result = compress2(counts_compressed.data(), &dest_len,
+                                counts_raw.data(), static_cast<uLong>(unpacked_count_size),
+                                miniz_level);
+      if (z_result == Z_OK && dest_len < unpacked_count_size) {
+        counts_compressed.resize(dest_len);
+        packed_count_size = dest_len;
+      } else {
+        counts_compressed = counts_raw;
+        packed_count_size = unpacked_count_size;
+      }
+    } else {
+      counts_compressed = counts_raw;
+    }
+
+    // Gather sample data for this block (channel by channel)
+    size_t unpacked_data_size = 0;
+    for (size_t c = 0; c < header.channels.size(); c++) {
+      unpacked_data_size += block_total_samples * channel_sizes[c];
+    }
+
+    std::vector<uint8_t> data_raw(unpacked_data_size);
+    uint8_t* data_ptr = data_raw.data();
+
+    for (size_t c = 0; c < header.channels.size(); c++) {
+      int ch_size = channel_sizes[c];
+      for (size_t s = 0; s < block_total_samples; s++) {
+        size_t sample_idx = sample_start + s;
+        float val = deep.channel_data[c][sample_idx];
+
+        if (ch_size == 2) {
+          // HALF
+          uint16_t h = FloatToHalf(val);
+          std::memcpy(data_ptr, &h, 2);
+          data_ptr += 2;
+        } else if (header.channels[c].pixel_type == PIXEL_TYPE_UINT) {
+          // UINT
+          uint32_t u = static_cast<uint32_t>(val);
+          std::memcpy(data_ptr, &u, 4);
+          data_ptr += 4;
+        } else {
+          // FLOAT
+          std::memcpy(data_ptr, &val, 4);
+          data_ptr += 4;
+        }
+      }
+    }
+
+    // Compress sample data
+    std::vector<uint8_t> data_compressed;
+    uint64_t packed_data_size = unpacked_data_size;
+
+    if (header.compression != COMPRESSION_NONE && unpacked_data_size > 0) {
+      data_compressed.resize(compressBound(static_cast<uLong>(unpacked_data_size)));
+      uLongf dest_len = static_cast<uLongf>(data_compressed.size());
+      int z_result = compress2(data_compressed.data(), &dest_len,
+                                data_raw.data(), static_cast<uLong>(unpacked_data_size),
+                                miniz_level);
+      if (z_result == Z_OK && dest_len < unpacked_data_size) {
+        data_compressed.resize(dest_len);
+        packed_data_size = dest_len;
+      } else {
+        data_compressed = data_raw;
+        packed_data_size = unpacked_data_size;
+      }
+    } else {
+      data_compressed = data_raw;
+    }
+
+    // Write block header: packed_count_size, unpacked_count_size, packed_data_size
+    write_u64(packed_count_size);
+    write_u64(unpacked_count_size);
+    write_u64(packed_data_size);
+
+    // Write compressed sample counts
+    write_bytes(counts_compressed.data(), packed_count_size);
+
+    // Write compressed sample data
+    if (packed_data_size > 0) {
+      write_bytes(data_compressed.data(), packed_data_size);
+    }
+  }
+
+  // Go back and write offset table
+  for (int i = 0; i < num_blocks; i++) {
+    size_t offset_pos = offset_table_pos + static_cast<size_t>(i) * 8;
+    uint64_t offset = block_offsets[static_cast<size_t>(i)];
+    for (int j = 0; j < 8; j++) {
+      output[offset_pos + j] = static_cast<uint8_t>((offset >> (j * 8)) & 0xFF);
+    }
+  }
+
+  auto result = Result<std::vector<uint8_t>>::ok(std::move(output));
+  result.warnings = warnings;
+  return result;
+}
+
+// Convenience overload with default compression level
+Result<std::vector<uint8_t>> SaveDeepToMemory(const DeepImageData& deep) {
+  return SaveDeepToMemory(deep, 6);
+}
+
+// Save deep scanline EXR to file
+Result<void> SaveDeepToFile(const char* filename, const DeepImageData& deep, int compression_level) {
+  if (!filename) {
+    return Result<void>::error(
+      ErrorInfo(ErrorCode::InvalidArgument, "Null filename",
+                "SaveDeepToFile", 0));
+  }
+
+  // Save to memory first
+  auto mem_result = SaveDeepToMemory(deep, compression_level);
+  if (!mem_result.success) {
+    Result<void> result;
+    result.success = false;
+    result.errors = mem_result.errors;
+    result.warnings = mem_result.warnings;
+    return result;
+  }
+
+  // Write to file
+  FILE* fp = fopen(filename, "wb");
+  if (!fp) {
+    return Result<void>::error(
+      ErrorInfo(ErrorCode::IOError, "Failed to open file for writing",
+                filename, 0));
+  }
+
+  size_t written = fwrite(mem_result.value.data(), 1, mem_result.value.size(), fp);
+  fclose(fp);
+
+  if (written != mem_result.value.size()) {
+    return Result<void>::error(
+      ErrorInfo(ErrorCode::IOError, "Failed to write all data to file",
+                filename, 0));
+  }
+
+  Result<void> result = Result<void>::ok();
+  result.warnings = mem_result.warnings;
+  return result;
+}
+
+// ============================================================================
 // Multipart Image Writing
 // ============================================================================
 
@@ -4599,11 +5064,18 @@ static Result<DeepImageData> LoadDeepScanlinePart(
                     num_block_pixels * 4);
       }
     } else {
-      // Decompress (zlib)
-      size_t uncomp_size = num_block_pixels * 4;
-      DecompressZipV2(reinterpret_cast<uint8_t*>(sample_counts.data()),
-                      &uncomp_size, count_compressed.data(),
-                      packed_count_size, pool);
+      // Decompress (raw zlib, no delta predictor or reordering for deep data)
+#if TINYEXR_USE_MINIZ
+      mz_ulong dest_len = static_cast<mz_ulong>(num_block_pixels * 4);
+      mz_uncompress(reinterpret_cast<uint8_t*>(sample_counts.data()),
+                    &dest_len, count_compressed.data(),
+                    static_cast<mz_ulong>(packed_count_size));
+#else
+      uLongf dest_len = static_cast<uLongf>(num_block_pixels * 4);
+      uncompress(reinterpret_cast<uint8_t*>(sample_counts.data()),
+                 &dest_len, count_compressed.data(),
+                 static_cast<uLong>(packed_count_size));
+#endif
     }
 
     // Copy to output sample_counts
@@ -4697,9 +5169,16 @@ static Result<DeepImageData> LoadDeepScanlinePart(
     if (packed_data_size == unpacked_data_size) {
       data_uncompressed = std::move(data_compressed);
     } else {
-      size_t uncomp_size = unpacked_data_size;
-      DecompressZipV2(data_uncompressed.data(), &uncomp_size,
-                      data_compressed.data(), packed_data_size, pool);
+      // Decompress (raw zlib, no delta predictor or reordering for deep data)
+#if TINYEXR_USE_MINIZ
+      mz_ulong dest_len = static_cast<mz_ulong>(unpacked_data_size);
+      mz_uncompress(data_uncompressed.data(), &dest_len,
+                    data_compressed.data(), static_cast<mz_ulong>(packed_data_size));
+#else
+      uLongf dest_len = static_cast<uLongf>(unpacked_data_size);
+      uncompress(data_uncompressed.data(), &dest_len,
+                 data_compressed.data(), static_cast<uLong>(packed_data_size));
+#endif
     }
 
     // Parse channel data from decompressed buffer

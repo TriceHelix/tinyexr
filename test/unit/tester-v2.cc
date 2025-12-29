@@ -1522,3 +1522,272 @@ TEST_CASE("v2: Tiled EXR with mipmap levels", "[Tiled][Mipmap][RoundTrip]") {
     REQUIRE(diff_count == 0);
   }
 }
+
+// ============================================================================
+// Deep Image Writing Tests
+// ============================================================================
+
+TEST_CASE("v2: Deep image basic write and read", "[Deep][RoundTrip]") {
+  // Create a simple deep image
+  const int width = 8;
+  const int height = 8;
+
+  tinyexr::v2::DeepImageData original;
+  original.width = width;
+  original.height = height;
+
+  // Set up header
+  original.header.compression = tinyexr::v2::COMPRESSION_ZIP;
+  original.header.data_window.min_x = 0;
+  original.header.data_window.min_y = 0;
+  original.header.data_window.max_x = width - 1;
+  original.header.data_window.max_y = height - 1;
+  original.header.display_window = original.header.data_window;
+  original.header.pixel_aspect_ratio = 1.0f;
+  original.header.screen_window_width = 1.0f;
+  original.header.line_order = 0;
+
+  // Set up channels (RGBA, HALF)
+  tinyexr::v2::Channel ch_a, ch_b, ch_g, ch_r, ch_z;
+  ch_r.name = "R"; ch_r.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_r.x_sampling = 1; ch_r.y_sampling = 1;
+  ch_g.name = "G"; ch_g.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_g.x_sampling = 1; ch_g.y_sampling = 1;
+  ch_b.name = "B"; ch_b.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_b.x_sampling = 1; ch_b.y_sampling = 1;
+  ch_a.name = "A"; ch_a.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_a.x_sampling = 1; ch_a.y_sampling = 1;
+  ch_z.name = "Z"; ch_z.pixel_type = tinyexr::v2::PIXEL_TYPE_FLOAT; ch_z.x_sampling = 1; ch_z.y_sampling = 1;
+
+  // Sort channels alphabetically (A, B, G, R, Z)
+  original.header.channels.push_back(ch_a);
+  original.header.channels.push_back(ch_b);
+  original.header.channels.push_back(ch_g);
+  original.header.channels.push_back(ch_r);
+  original.header.channels.push_back(ch_z);
+  original.num_channels = 5;
+
+  // Create sample counts: varying number of samples per pixel
+  original.sample_counts.resize(static_cast<size_t>(width) * height);
+  size_t total = 0;
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      // 1-3 samples per pixel based on position
+      uint32_t count = 1 + (x + y) % 3;
+      original.sample_counts[static_cast<size_t>(y) * width + x] = count;
+      total += count;
+    }
+  }
+  original.total_samples = total;
+
+  // Create channel data
+  original.channel_data.resize(5);
+  for (size_t c = 0; c < 5; c++) {
+    original.channel_data[c].resize(total);
+  }
+
+  // Fill with test pattern
+  size_t sample_idx = 0;
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      uint32_t count = original.sample_counts[static_cast<size_t>(y) * width + x];
+      for (uint32_t s = 0; s < count; s++) {
+        // RGBA values + Z depth
+        original.channel_data[0][sample_idx] = 1.0f;  // A
+        original.channel_data[1][sample_idx] = static_cast<float>(x) / width;  // B
+        original.channel_data[2][sample_idx] = static_cast<float>(y) / height;  // G
+        original.channel_data[3][sample_idx] = 0.5f + 0.1f * s;  // R
+        original.channel_data[4][sample_idx] = 1.0f + 0.5f * s;  // Z (depth)
+        sample_idx++;
+      }
+    }
+  }
+
+  SECTION("Basic deep write and read") {
+    auto save_result = tinyexr::v2::SaveDeepToMemory(original, 6);
+
+    if (!save_result.success) {
+      INFO("Save error: " + save_result.error_string());
+    }
+    REQUIRE(save_result.success == true);
+    REQUIRE(save_result.value.size() > 0);
+
+    INFO("Deep: Saved " << save_result.value.size() << " bytes for "
+         << total << " total samples");
+
+    // Load back as multipart (deep images are loaded via multipart API)
+    auto load_result = tinyexr::v2::LoadMultipartFromMemory(
+        save_result.value.data(), save_result.value.size());
+
+    if (!load_result.success) {
+      INFO("Load error: " + load_result.error_string());
+    }
+    REQUIRE(load_result.success == true);
+    REQUIRE(load_result.value.deep_parts.size() == 1);
+
+    const auto& loaded = load_result.value.deep_parts[0];
+
+    REQUIRE(loaded.width == original.width);
+    REQUIRE(loaded.height == original.height);
+    REQUIRE(loaded.total_samples == original.total_samples);
+    REQUIRE(loaded.sample_counts.size() == original.sample_counts.size());
+
+    // Verify sample counts
+    for (size_t i = 0; i < loaded.sample_counts.size(); i++) {
+      REQUIRE(loaded.sample_counts[i] == original.sample_counts[i]);
+    }
+
+    // Verify channel data (with tolerance for HALF precision)
+    const float tolerance = 0.002f;
+    int diff_count = 0;
+    for (size_t c = 0; c < loaded.channel_data.size() && c < original.channel_data.size(); c++) {
+      for (size_t s = 0; s < loaded.channel_data[c].size(); s++) {
+        float diff = std::abs(loaded.channel_data[c][s] - original.channel_data[c][s]);
+        if (diff > tolerance) {
+          diff_count++;
+        }
+      }
+    }
+
+    if (diff_count > 0) {
+      INFO("Deep: Channel data differs at " << diff_count << " samples");
+    }
+    REQUIRE(diff_count == 0);
+  }
+}
+
+TEST_CASE("v2: Deep image with uniform samples", "[Deep][Uniform]") {
+  // Deep image where all pixels have the same sample count
+  const int width = 16;
+  const int height = 16;
+  const uint32_t samples_per_pixel = 2;
+
+  tinyexr::v2::DeepImageData original;
+  original.width = width;
+  original.height = height;
+
+  // Set up header
+  original.header.compression = tinyexr::v2::COMPRESSION_ZIPS;  // Single-line ZIP
+  original.header.data_window.min_x = 0;
+  original.header.data_window.min_y = 0;
+  original.header.data_window.max_x = width - 1;
+  original.header.data_window.max_y = height - 1;
+  original.header.display_window = original.header.data_window;
+  original.header.pixel_aspect_ratio = 1.0f;
+  original.header.screen_window_width = 1.0f;
+
+  // Simple RGBA channels
+  tinyexr::v2::Channel ch_a, ch_b, ch_g, ch_r;
+  ch_a.name = "A"; ch_a.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_a.x_sampling = 1; ch_a.y_sampling = 1;
+  ch_b.name = "B"; ch_b.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_b.x_sampling = 1; ch_b.y_sampling = 1;
+  ch_g.name = "G"; ch_g.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_g.x_sampling = 1; ch_g.y_sampling = 1;
+  ch_r.name = "R"; ch_r.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_r.x_sampling = 1; ch_r.y_sampling = 1;
+  original.header.channels.push_back(ch_a);
+  original.header.channels.push_back(ch_b);
+  original.header.channels.push_back(ch_g);
+  original.header.channels.push_back(ch_r);
+  original.num_channels = 4;
+
+  // Uniform sample counts
+  size_t num_pixels = static_cast<size_t>(width) * height;
+  original.sample_counts.resize(num_pixels, samples_per_pixel);
+  original.total_samples = num_pixels * samples_per_pixel;
+
+  // Create channel data
+  original.channel_data.resize(4);
+  for (size_t c = 0; c < 4; c++) {
+    original.channel_data[c].resize(original.total_samples);
+  }
+
+  // Fill with gradient pattern
+  size_t idx = 0;
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      for (uint32_t s = 0; s < samples_per_pixel; s++) {
+        original.channel_data[0][idx] = 1.0f;  // A
+        original.channel_data[1][idx] = static_cast<float>(x) / width;  // B
+        original.channel_data[2][idx] = static_cast<float>(y) / height;  // G
+        original.channel_data[3][idx] = 0.5f;  // R
+        idx++;
+      }
+    }
+  }
+
+  auto save_result = tinyexr::v2::SaveDeepToMemory(original, 6);
+  REQUIRE(save_result.success == true);
+
+  auto load_result = tinyexr::v2::LoadMultipartFromMemory(
+      save_result.value.data(), save_result.value.size());
+  REQUIRE(load_result.success == true);
+  REQUIRE(load_result.value.deep_parts.size() == 1);
+
+  const auto& loaded = load_result.value.deep_parts[0];
+  REQUIRE(loaded.total_samples == original.total_samples);
+
+  // Verify all sample counts are correct
+  for (size_t i = 0; i < num_pixels; i++) {
+    REQUIRE(loaded.sample_counts[i] == samples_per_pixel);
+  }
+}
+
+TEST_CASE("v2: Deep image with empty pixels", "[Deep][Sparse]") {
+  // Deep image with some pixels having zero samples
+  const int width = 8;
+  const int height = 8;
+
+  tinyexr::v2::DeepImageData original;
+  original.width = width;
+  original.height = height;
+
+  // Set up header
+  original.header.compression = tinyexr::v2::COMPRESSION_NONE;  // No compression
+  original.header.data_window.min_x = 0;
+  original.header.data_window.min_y = 0;
+  original.header.data_window.max_x = width - 1;
+  original.header.data_window.max_y = height - 1;
+  original.header.display_window = original.header.data_window;
+  original.header.pixel_aspect_ratio = 1.0f;
+  original.header.screen_window_width = 1.0f;
+
+  // Single channel (Z depth)
+  tinyexr::v2::Channel ch_z;
+  ch_z.name = "Z"; ch_z.pixel_type = tinyexr::v2::PIXEL_TYPE_FLOAT; ch_z.x_sampling = 1; ch_z.y_sampling = 1;
+  original.header.channels.push_back(ch_z);
+  original.num_channels = 1;
+
+  // Sparse sample counts: checkerboard pattern (0 or 1 sample)
+  size_t num_pixels = static_cast<size_t>(width) * height;
+  original.sample_counts.resize(num_pixels);
+  size_t total = 0;
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      uint32_t count = ((x + y) % 2 == 0) ? 1 : 0;
+      original.sample_counts[static_cast<size_t>(y) * width + x] = count;
+      total += count;
+    }
+  }
+  original.total_samples = total;
+
+  // Create channel data (only for non-empty pixels)
+  original.channel_data.resize(1);
+  original.channel_data[0].resize(total);
+  for (size_t i = 0; i < total; i++) {
+    original.channel_data[0][i] = static_cast<float>(i) * 0.1f;  // Depth
+  }
+
+  auto save_result = tinyexr::v2::SaveDeepToMemory(original, 6);
+  REQUIRE(save_result.success == true);
+
+  auto load_result = tinyexr::v2::LoadMultipartFromMemory(
+      save_result.value.data(), save_result.value.size());
+  REQUIRE(load_result.success == true);
+  REQUIRE(load_result.value.deep_parts.size() == 1);
+
+  const auto& loaded = load_result.value.deep_parts[0];
+  REQUIRE(loaded.total_samples == original.total_samples);
+
+  // Verify sparse pattern preserved
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      size_t idx = static_cast<size_t>(y) * width + x;
+      uint32_t expected = ((x + y) % 2 == 0) ? 1 : 0;
+      REQUIRE(loaded.sample_counts[idx] == expected);
+    }
+  }
+}
