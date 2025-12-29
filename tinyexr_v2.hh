@@ -1011,6 +1011,15 @@ Result<std::vector<uint8_t>> SaveDeepToMemory(const DeepImageData& deep);
 // Save deep scanline EXR to file
 Result<void> SaveDeepToFile(const char* filename, const DeepImageData& deep, int compression_level = 6);
 
+// Save deep tiled EXR to memory
+// The deep.header must have type="deeptile", tile_size_x>0, and tile_size_y>0
+// compression_level: 1-9 for ZIP compression (6 = default)
+Result<std::vector<uint8_t>> SaveDeepTiledToMemory(const DeepImageData& deep, int compression_level);
+Result<std::vector<uint8_t>> SaveDeepTiledToMemory(const DeepImageData& deep);
+
+// Save deep tiled EXR to file
+Result<void> SaveDeepTiledToFile(const char* filename, const DeepImageData& deep, int compression_level = 6);
+
 // Save multipart image data to memory
 // compression_level: 1-9 for ZIP compression (6 = default)
 Result<std::vector<uint8_t>> SaveMultipartToMemory(const MultipartImageData& multipart, int compression_level);

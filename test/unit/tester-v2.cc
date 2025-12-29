@@ -2204,6 +2204,85 @@ TEST_CASE("v2: Custom attributes round-trip", "[v2][attributes]") {
   REQUIRE(std::abs(y - 2.5f) < 0.0001f);
 }
 
+TEST_CASE("v2: Deep tiled write and read", "[v2][deep][tiled]") {
+  using namespace tinyexr::v2;
+
+  const int width = 32;
+  const int height = 32;
+
+  // Create deep image data
+  DeepImageData deep;
+  deep.width = width;
+  deep.height = height;
+
+  // Set up sample counts - varying depths
+  deep.sample_counts.resize(width * height);
+  deep.total_samples = 0;
+
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      // Variable sample count: 1 to 4 samples per pixel
+      uint32_t count = static_cast<uint32_t>((x + y) % 4 + 1);
+      deep.sample_counts[y * width + x] = count;
+      deep.total_samples += count;
+    }
+  }
+
+  // Set up channels (depth + alpha)
+  Channel ch_z, ch_a;
+  ch_z.name = "Z";
+  ch_z.pixel_type = PIXEL_TYPE_FLOAT;
+  ch_z.x_sampling = 1;
+  ch_z.y_sampling = 1;
+  ch_a.name = "A";
+  ch_a.pixel_type = PIXEL_TYPE_HALF;
+  ch_a.x_sampling = 1;
+  ch_a.y_sampling = 1;
+  deep.header.channels.push_back(ch_a);
+  deep.header.channels.push_back(ch_z);
+
+  // Fill channel data
+  deep.channel_data.resize(2);
+  deep.channel_data[0].resize(deep.total_samples); // A
+  deep.channel_data[1].resize(deep.total_samples); // Z
+
+  size_t sample_idx = 0;
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      uint32_t count = deep.sample_counts[y * width + x];
+      for (uint32_t s = 0; s < count; s++) {
+        deep.channel_data[0][sample_idx] = 0.5f + 0.1f * s;  // A
+        deep.channel_data[1][sample_idx] = 1.0f + static_cast<float>(s) * 0.5f;  // Z
+        sample_idx++;
+      }
+    }
+  }
+
+  deep.header.compression = COMPRESSION_ZIP;
+  deep.header.tile_size_x = 16;
+  deep.header.tile_size_y = 16;
+
+  // Save as deep tiled
+  auto save_result = SaveDeepTiledToMemory(deep, 6);
+  REQUIRE(save_result.success);
+  INFO("Deep tiled: Saved " << save_result.value.size() << " bytes");
+
+  // Verify magic and version flags
+  REQUIRE(save_result.value.size() > 8);
+  REQUIRE(save_result.value[0] == 0x76);
+  REQUIRE(save_result.value[1] == 0x2f);
+  REQUIRE(save_result.value[2] == 0x31);
+  REQUIRE(save_result.value[3] == 0x01);
+
+  // Check version byte has tiled and non_image flags set
+  uint32_t version_bits = save_result.value[4] |
+                          (save_result.value[5] << 8) |
+                          (save_result.value[6] << 16) |
+                          (save_result.value[7] << 24);
+  REQUIRE((version_bits & 0x200) != 0);  // tiled flag
+  REQUIRE((version_bits & 0x800) != 0);  // non_image flag (deep)
+}
+
 TEST_CASE("v2: Spectral EXR attributes", "[v2][attributes][spectral]") {
   using namespace tinyexr::v2;
 

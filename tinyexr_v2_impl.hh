@@ -4623,6 +4623,561 @@ Result<void> SaveDeepToFile(const char* filename, const DeepImageData& deep, int
 }
 
 // ============================================================================
+// Deep Tiled Image Writing
+// ============================================================================
+
+Result<std::vector<uint8_t>> SaveDeepTiledToMemory(const DeepImageData& deep, int compression_level) {
+  std::vector<uint8_t> output;
+  std::vector<std::string> warnings;
+
+  // Validate input
+  if (deep.width <= 0 || deep.height <= 0) {
+    return Result<std::vector<uint8_t>>::error(
+      ErrorInfo(ErrorCode::InvalidArgument, "Invalid deep image dimensions",
+                "SaveDeepTiledToMemory", 0));
+  }
+
+  if (deep.sample_counts.size() != static_cast<size_t>(deep.width) * deep.height) {
+    return Result<std::vector<uint8_t>>::error(
+      ErrorInfo(ErrorCode::InvalidArgument,
+                "Sample counts array size mismatch with dimensions",
+                "SaveDeepTiledToMemory", 0));
+  }
+
+  if (deep.header.channels.empty()) {
+    return Result<std::vector<uint8_t>>::error(
+      ErrorInfo(ErrorCode::InvalidArgument, "No channels specified",
+                "SaveDeepTiledToMemory", 0));
+  }
+
+  // Verify total_samples matches sum of sample_counts
+  size_t counted_samples = 0;
+  for (size_t i = 0; i < deep.sample_counts.size(); i++) {
+    counted_samples += deep.sample_counts[i];
+  }
+  if (counted_samples != deep.total_samples) {
+    return Result<std::vector<uint8_t>>::error(
+      ErrorInfo(ErrorCode::InvalidArgument,
+                "total_samples doesn't match sum of sample_counts",
+                "SaveDeepTiledToMemory", 0));
+  }
+
+  // Verify channel_data sizes
+  for (size_t c = 0; c < deep.header.channels.size(); c++) {
+    if (deep.channel_data.size() <= c || deep.channel_data[c].size() != deep.total_samples) {
+      return Result<std::vector<uint8_t>>::error(
+        ErrorInfo(ErrorCode::InvalidArgument,
+                  "Channel data size mismatch for channel " + std::to_string(c),
+                  "SaveDeepTiledToMemory", 0));
+    }
+  }
+
+  int width = deep.width;
+  int height = deep.height;
+
+  // Create header copy with deep tiled settings
+  Header header = deep.header;
+  header.type = "deeptile";
+  header.tiled = true;
+  header.is_deep = true;
+
+  // Default tile size if not specified
+  if (header.tile_size_x <= 0) header.tile_size_x = 64;
+  if (header.tile_size_y <= 0) header.tile_size_y = 64;
+  header.tile_level_mode = TILE_ONE_LEVEL;  // Only single level for now
+  header.tile_rounding_mode = 0;
+
+  if (header.data_window.max_x == 0 && header.data_window.max_y == 0) {
+    header.data_window.min_x = 0;
+    header.data_window.min_y = 0;
+    header.data_window.max_x = width - 1;
+    header.data_window.max_y = height - 1;
+    header.display_window = header.data_window;
+  }
+  if (header.pixel_aspect_ratio <= 0.0f) {
+    header.pixel_aspect_ratio = 1.0f;
+  }
+  if (header.screen_window_width <= 0.0f) {
+    header.screen_window_width = 1.0f;
+  }
+
+  // Default to ZIP compression for deep if none specified
+  if (header.compression == COMPRESSION_NONE) {
+    header.compression = COMPRESSION_ZIP;
+  }
+  // Deep only supports NONE, RLE, ZIPS, ZIP
+  if (header.compression != COMPRESSION_NONE &&
+      header.compression != COMPRESSION_RLE &&
+      header.compression != COMPRESSION_ZIPS &&
+      header.compression != COMPRESSION_ZIP) {
+    warnings.push_back("Compression type not supported for deep images, using ZIP");
+    header.compression = COMPRESSION_ZIP;
+  }
+
+  int miniz_level = compression_level;
+  if (miniz_level < 1) miniz_level = 1;
+  if (miniz_level > 9) miniz_level = 9;
+
+  // Calculate tile counts
+  int num_x_tiles = (width + header.tile_size_x - 1) / header.tile_size_x;
+  int num_y_tiles = (height + header.tile_size_y - 1) / header.tile_size_y;
+  int total_tiles = num_x_tiles * num_y_tiles;
+  header.chunk_count = total_tiles;
+
+  // Calculate bytes per sample for each channel
+  std::vector<int> channel_sizes;
+  for (size_t c = 0; c < header.channels.size(); c++) {
+    int sz = 4;  // Default FLOAT
+    switch (header.channels[c].pixel_type) {
+      case PIXEL_TYPE_UINT:  sz = 4; break;
+      case PIXEL_TYPE_HALF:  sz = 2; break;
+      case PIXEL_TYPE_FLOAT: sz = 4; break;
+      default: sz = 4; break;
+    }
+    channel_sizes.push_back(sz);
+  }
+
+  // Create version (deep tiled = tiled + non_image flags set)
+  Version version;
+  version.version = 2;
+  version.tiled = true;
+  version.long_name = false;
+  version.non_image = true;  // Deep data flag
+  version.multipart = false;
+
+  // Reserve space for output
+  output.reserve(1024 * 1024);  // 1MB initial
+
+  // Write magic number
+  output.push_back(0x76);
+  output.push_back(0x2f);
+  output.push_back(0x31);
+  output.push_back(0x01);
+
+  // Write version
+  uint32_t version_bits = version.version;
+  if (version.tiled) version_bits |= 0x200;
+  if (version.long_name) version_bits |= 0x400;
+  if (version.non_image) version_bits |= 0x800;
+  if (version.multipart) version_bits |= 0x1000;
+  output.push_back(static_cast<uint8_t>(version_bits & 0xFF));
+  output.push_back(static_cast<uint8_t>((version_bits >> 8) & 0xFF));
+  output.push_back(static_cast<uint8_t>((version_bits >> 16) & 0xFF));
+  output.push_back(static_cast<uint8_t>((version_bits >> 24) & 0xFF));
+
+  // Helper lambdas
+  auto write_bytes = [&output](const void* data, size_t len) {
+    const uint8_t* ptr = static_cast<const uint8_t*>(data);
+    output.insert(output.end(), ptr, ptr + len);
+  };
+
+  auto write_string = [&output](const std::string& s) {
+    output.insert(output.end(), s.begin(), s.end());
+    output.push_back(0);
+  };
+
+  auto write_u32 = [&output](uint32_t v) {
+    output.push_back(static_cast<uint8_t>(v & 0xFF));
+    output.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+    output.push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
+    output.push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
+  };
+
+  auto write_i32 = [&output](int32_t v) {
+    uint32_t u;
+    std::memcpy(&u, &v, 4);
+    output.push_back(static_cast<uint8_t>(u & 0xFF));
+    output.push_back(static_cast<uint8_t>((u >> 8) & 0xFF));
+    output.push_back(static_cast<uint8_t>((u >> 16) & 0xFF));
+    output.push_back(static_cast<uint8_t>((u >> 24) & 0xFF));
+  };
+
+  auto write_u64 = [&output](uint64_t v) {
+    for (int i = 0; i < 8; i++) {
+      output.push_back(static_cast<uint8_t>((v >> (i * 8)) & 0xFF));
+    }
+  };
+
+  auto write_float = [&output](float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    output.push_back(static_cast<uint8_t>(u & 0xFF));
+    output.push_back(static_cast<uint8_t>((u >> 8) & 0xFF));
+    output.push_back(static_cast<uint8_t>((u >> 16) & 0xFF));
+    output.push_back(static_cast<uint8_t>((u >> 24) & 0xFF));
+  };
+
+  auto write_attribute = [&](const std::string& name, const std::string& type,
+                              const void* data, size_t size) {
+    write_string(name);
+    write_string(type);
+    write_u32(static_cast<uint32_t>(size));
+    write_bytes(data, size);
+  };
+
+  // Write header attributes
+
+  // channels (chlist)
+  {
+    std::vector<uint8_t> chlist;
+    for (const auto& ch : header.channels) {
+      for (char c : ch.name) chlist.push_back(static_cast<uint8_t>(c));
+      chlist.push_back(0);
+      uint32_t pt = ch.pixel_type;
+      chlist.push_back(static_cast<uint8_t>(pt & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((pt >> 8) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((pt >> 16) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((pt >> 24) & 0xFF));
+      chlist.push_back(0); chlist.push_back(0);
+      chlist.push_back(0); chlist.push_back(0);
+      int32_t xs = ch.x_sampling > 0 ? ch.x_sampling : 1;
+      chlist.push_back(static_cast<uint8_t>(xs & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((xs >> 8) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((xs >> 16) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((xs >> 24) & 0xFF));
+      int32_t ys = ch.y_sampling > 0 ? ch.y_sampling : 1;
+      chlist.push_back(static_cast<uint8_t>(ys & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((ys >> 8) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((ys >> 16) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((ys >> 24) & 0xFF));
+    }
+    chlist.push_back(0);
+    write_attribute("channels", "chlist", chlist.data(), chlist.size());
+  }
+
+  // compression
+  {
+    uint8_t comp = static_cast<uint8_t>(header.compression);
+    write_attribute("compression", "compression", &comp, 1);
+  }
+
+  // dataWindow
+  {
+    int32_t dw[4] = {header.data_window.min_x, header.data_window.min_y,
+                     header.data_window.max_x, header.data_window.max_y};
+    write_attribute("dataWindow", "box2i", dw, 16);
+  }
+
+  // displayWindow
+  {
+    int32_t dw[4] = {header.display_window.min_x, header.display_window.min_y,
+                     header.display_window.max_x, header.display_window.max_y};
+    write_attribute("displayWindow", "box2i", dw, 16);
+  }
+
+  // lineOrder
+  {
+    uint8_t lo = static_cast<uint8_t>(header.line_order);
+    write_attribute("lineOrder", "lineOrder", &lo, 1);
+  }
+
+  // pixelAspectRatio
+  {
+    write_attribute("pixelAspectRatio", "float", &header.pixel_aspect_ratio, 4);
+  }
+
+  // screenWindowCenter
+  {
+    float swc[2] = {header.screen_window_center[0], header.screen_window_center[1]};
+    write_attribute("screenWindowCenter", "v2f", swc, 8);
+  }
+
+  // screenWindowWidth
+  {
+    write_attribute("screenWindowWidth", "float", &header.screen_window_width, 4);
+  }
+
+  // tiles (tiledesc) - required for tiled images
+  {
+    std::vector<uint8_t> tiledesc(9);
+    uint32_t tx = header.tile_size_x;
+    uint32_t ty = header.tile_size_y;
+    tiledesc[0] = static_cast<uint8_t>(tx & 0xFF);
+    tiledesc[1] = static_cast<uint8_t>((tx >> 8) & 0xFF);
+    tiledesc[2] = static_cast<uint8_t>((tx >> 16) & 0xFF);
+    tiledesc[3] = static_cast<uint8_t>((tx >> 24) & 0xFF);
+    tiledesc[4] = static_cast<uint8_t>(ty & 0xFF);
+    tiledesc[5] = static_cast<uint8_t>((ty >> 8) & 0xFF);
+    tiledesc[6] = static_cast<uint8_t>((ty >> 16) & 0xFF);
+    tiledesc[7] = static_cast<uint8_t>((ty >> 24) & 0xFF);
+    uint8_t mode = static_cast<uint8_t>(header.tile_level_mode & 0x0F);
+    mode |= static_cast<uint8_t>((header.tile_rounding_mode & 0x01) << 4);
+    tiledesc[8] = mode;
+    write_attribute("tiles", "tiledesc", tiledesc.data(), 9);
+  }
+
+  // type (required for deep)
+  {
+    write_attribute("type", "string", header.type.data(), header.type.size());
+  }
+
+  // chunkCount (required for multipart/deep)
+  {
+    int32_t cc = header.chunk_count;
+    write_attribute("chunkCount", "int", &cc, 4);
+  }
+
+  // version (deep data version = 1)
+  {
+    int32_t ver = 1;
+    write_attribute("version", "int", &ver, 4);
+  }
+
+  // Custom attributes
+  for (const auto& attr : header.custom_attributes) {
+    if (attr.name.empty()) continue;
+    write_string(attr.name);
+    write_string(attr.type);
+    write_u32(static_cast<uint32_t>(attr.data.size()));
+    if (!attr.data.empty()) {
+      write_bytes(attr.data.data(), attr.data.size());
+    }
+  }
+
+  // End of header
+  output.push_back(0);
+
+  // Reserve space for tile offset table
+  size_t offset_table_pos = output.size();
+  std::vector<uint64_t> tile_offsets(static_cast<size_t>(total_tiles), 0);
+  for (int i = 0; i < total_tiles; i++) {
+    write_u64(0);  // Placeholder
+  }
+
+  // Build cumulative sample index for quick lookup
+  std::vector<size_t> cumulative_samples(static_cast<size_t>(width) * height + 1);
+  cumulative_samples[0] = 0;
+  for (size_t i = 0; i < deep.sample_counts.size(); i++) {
+    cumulative_samples[i + 1] = cumulative_samples[i] + deep.sample_counts[i];
+  }
+
+  // Write each tile
+  int tile_idx = 0;
+  for (int tile_y = 0; tile_y < num_y_tiles; tile_y++) {
+    for (int tile_x = 0; tile_x < num_x_tiles; tile_x++) {
+      tile_offsets[static_cast<size_t>(tile_idx)] = output.size();
+
+      // Tile coordinates
+      int tile_start_x = tile_x * header.tile_size_x;
+      int tile_start_y = tile_y * header.tile_size_y;
+      int tile_end_x = std::min(tile_start_x + header.tile_size_x, width);
+      int tile_end_y = std::min(tile_start_y + header.tile_size_y, height);
+      int tile_w = tile_end_x - tile_start_x;
+      int tile_h = tile_end_y - tile_start_y;
+      size_t num_tile_pixels = static_cast<size_t>(tile_w) * tile_h;
+
+      // Write tile header: tile_x, tile_y, level_x, level_y
+      write_i32(tile_x);
+      write_i32(tile_y);
+      write_i32(0);  // level_x (always 0 for ONE_LEVEL)
+      write_i32(0);  // level_y
+
+      // Gather sample counts for this tile
+      std::vector<uint32_t> tile_counts(num_tile_pixels);
+      size_t tile_total_samples = 0;
+
+      for (int y = tile_start_y; y < tile_end_y; y++) {
+        for (int x = tile_start_x; x < tile_end_x; x++) {
+          size_t pixel_idx = static_cast<size_t>(y) * width + x;
+          size_t tile_pixel_idx = static_cast<size_t>(y - tile_start_y) * tile_w + (x - tile_start_x);
+          tile_counts[tile_pixel_idx] = deep.sample_counts[pixel_idx];
+          tile_total_samples += deep.sample_counts[pixel_idx];
+        }
+      }
+
+      // Compress sample counts
+      std::vector<uint8_t> counts_raw(num_tile_pixels * 4);
+      std::memcpy(counts_raw.data(), tile_counts.data(), num_tile_pixels * 4);
+
+      std::vector<uint8_t> counts_compressed;
+      uint64_t unpacked_count_size = num_tile_pixels * 4;
+      uint64_t packed_count_size = unpacked_count_size;
+
+      if (header.compression != COMPRESSION_NONE) {
+#if defined(TINYEXR_USE_MINIZ)
+        mz_ulong compressed_size = static_cast<mz_ulong>(unpacked_count_size + unpacked_count_size / 1000 + 128);
+        counts_compressed.resize(compressed_size);
+        int z_result = mz_compress2(counts_compressed.data(), &compressed_size,
+                                    counts_raw.data(), static_cast<mz_ulong>(unpacked_count_size),
+                                    miniz_level);
+        if (z_result == MZ_OK && compressed_size < unpacked_count_size) {
+          counts_compressed.resize(compressed_size);
+          packed_count_size = compressed_size;
+        } else {
+          counts_compressed = counts_raw;
+          packed_count_size = unpacked_count_size;
+        }
+#elif defined(TINYEXR_USE_ZLIB)
+        uLongf compressed_size = compressBound(static_cast<uLong>(unpacked_count_size));
+        counts_compressed.resize(compressed_size);
+        int z_result = compress2(counts_compressed.data(), &compressed_size,
+                                  counts_raw.data(), static_cast<uLong>(unpacked_count_size),
+                                  miniz_level);
+        if (z_result == Z_OK && compressed_size < unpacked_count_size) {
+          counts_compressed.resize(compressed_size);
+          packed_count_size = compressed_size;
+        } else {
+          counts_compressed = counts_raw;
+          packed_count_size = unpacked_count_size;
+        }
+#else
+        counts_compressed = counts_raw;
+        packed_count_size = unpacked_count_size;
+#endif
+      } else {
+        counts_compressed = counts_raw;
+      }
+
+      // Gather sample data for this tile (channel by channel)
+      size_t unpacked_data_size = 0;
+      for (size_t c = 0; c < header.channels.size(); c++) {
+        unpacked_data_size += tile_total_samples * channel_sizes[c];
+      }
+
+      std::vector<uint8_t> data_raw(unpacked_data_size);
+      uint8_t* data_ptr = data_raw.data();
+
+      for (size_t c = 0; c < header.channels.size(); c++) {
+        int ch_size = channel_sizes[c];
+        // For each pixel in tile, write its samples
+        for (int y = tile_start_y; y < tile_end_y; y++) {
+          for (int x = tile_start_x; x < tile_end_x; x++) {
+            size_t pixel_idx = static_cast<size_t>(y) * width + x;
+            size_t sample_start = cumulative_samples[pixel_idx];
+            uint32_t num_samples = deep.sample_counts[pixel_idx];
+
+            for (uint32_t s = 0; s < num_samples; s++) {
+              float val = deep.channel_data[c][sample_start + s];
+
+              if (ch_size == 2) {
+                uint16_t h = FloatToHalf(val);
+                std::memcpy(data_ptr, &h, 2);
+                data_ptr += 2;
+              } else if (header.channels[c].pixel_type == PIXEL_TYPE_UINT) {
+                uint32_t u = static_cast<uint32_t>(val);
+                std::memcpy(data_ptr, &u, 4);
+                data_ptr += 4;
+              } else {
+                std::memcpy(data_ptr, &val, 4);
+                data_ptr += 4;
+              }
+            }
+          }
+        }
+      }
+
+      // Compress sample data
+      std::vector<uint8_t> data_compressed;
+      uint64_t packed_data_size = unpacked_data_size;
+
+      if (header.compression != COMPRESSION_NONE && unpacked_data_size > 0) {
+#if defined(TINYEXR_USE_MINIZ)
+        mz_ulong compressed_size = static_cast<mz_ulong>(unpacked_data_size + unpacked_data_size / 1000 + 128);
+        data_compressed.resize(compressed_size);
+        int z_result = mz_compress2(data_compressed.data(), &compressed_size,
+                                    data_raw.data(), static_cast<mz_ulong>(unpacked_data_size),
+                                    miniz_level);
+        if (z_result == MZ_OK && compressed_size < unpacked_data_size) {
+          data_compressed.resize(compressed_size);
+          packed_data_size = compressed_size;
+        } else {
+          data_compressed = data_raw;
+          packed_data_size = unpacked_data_size;
+        }
+#elif defined(TINYEXR_USE_ZLIB)
+        uLongf compressed_size = compressBound(static_cast<uLong>(unpacked_data_size));
+        data_compressed.resize(compressed_size);
+        int z_result = compress2(data_compressed.data(), &compressed_size,
+                                  data_raw.data(), static_cast<uLong>(unpacked_data_size),
+                                  miniz_level);
+        if (z_result == Z_OK && compressed_size < unpacked_data_size) {
+          data_compressed.resize(compressed_size);
+          packed_data_size = compressed_size;
+        } else {
+          data_compressed = data_raw;
+          packed_data_size = unpacked_data_size;
+        }
+#else
+        data_compressed = data_raw;
+        packed_data_size = unpacked_data_size;
+#endif
+      } else {
+        data_compressed = data_raw;
+      }
+
+      // Write tile data: packed_count_size, unpacked_count_size, packed_data_size
+      write_u64(packed_count_size);
+      write_u64(unpacked_count_size);
+      write_u64(packed_data_size);
+
+      // Write compressed sample counts
+      write_bytes(counts_compressed.data(), packed_count_size);
+
+      // Write compressed sample data
+      if (packed_data_size > 0) {
+        write_bytes(data_compressed.data(), packed_data_size);
+      }
+
+      tile_idx++;
+    }
+  }
+
+  // Go back and write offset table
+  for (int i = 0; i < total_tiles; i++) {
+    size_t offset_pos = offset_table_pos + static_cast<size_t>(i) * 8;
+    uint64_t offset = tile_offsets[static_cast<size_t>(i)];
+    for (int j = 0; j < 8; j++) {
+      output[offset_pos + j] = static_cast<uint8_t>((offset >> (j * 8)) & 0xFF);
+    }
+  }
+
+  auto result = Result<std::vector<uint8_t>>::ok(std::move(output));
+  result.warnings = warnings;
+  return result;
+}
+
+Result<std::vector<uint8_t>> SaveDeepTiledToMemory(const DeepImageData& deep) {
+  return SaveDeepTiledToMemory(deep, 6);
+}
+
+Result<void> SaveDeepTiledToFile(const char* filename, const DeepImageData& deep, int compression_level) {
+  if (!filename) {
+    return Result<void>::error(
+      ErrorInfo(ErrorCode::InvalidArgument, "Null filename",
+                "SaveDeepTiledToFile", 0));
+  }
+
+  auto mem_result = SaveDeepTiledToMemory(deep, compression_level);
+  if (!mem_result.success) {
+    Result<void> result;
+    result.success = false;
+    result.errors = mem_result.errors;
+    result.warnings = mem_result.warnings;
+    return result;
+  }
+
+  FILE* fp = fopen(filename, "wb");
+  if (!fp) {
+    return Result<void>::error(
+      ErrorInfo(ErrorCode::IOError, "Failed to open file for writing",
+                filename, 0));
+  }
+
+  size_t written = fwrite(mem_result.value.data(), 1, mem_result.value.size(), fp);
+  fclose(fp);
+
+  if (written != mem_result.value.size()) {
+    return Result<void>::error(
+      ErrorInfo(ErrorCode::IOError, "Failed to write all data to file",
+                filename, 0));
+  }
+
+  Result<void> result = Result<void>::ok();
+  result.warnings = mem_result.warnings;
+  return result;
+}
+
+// ============================================================================
 // Multipart Image Writing
 // ============================================================================
 
