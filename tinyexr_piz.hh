@@ -1368,7 +1368,232 @@ inline tinyexr::v2::Result<void> DecompressPizV2(
 }
 
 // ============================================================================
-// PIZ Compression (V2 API) - Phase 2
+// Huffman Encoding Functions (for PIZ compression)
+// ============================================================================
+
+// Count symbol frequencies in data
+inline void countFrequencies(int64_t* freq, const uint16_t* data, int n) {
+  for (int i = 0; i < HUF_ENCSIZE; i++) {
+    freq[i] = 0;
+  }
+  for (int i = 0; i < n; i++) {
+    freq[data[i]]++;
+  }
+}
+
+// Heap comparison functor for Huffman tree building
+struct HufHeapCompare {
+  bool operator()(int64_t* a, int64_t* b) const { return *a > *b; }
+};
+
+// Build Huffman encoding table from frequencies
+// Returns false on failure (encoding would be too long)
+inline bool hufBuildEncTable(int64_t* freq, int* im, int* iM) {
+  // Find min and max non-zero indices
+  *im = 0;
+  while (*im < HUF_ENCSIZE && freq[*im] == 0) (*im)++;
+
+  *iM = HUF_ENCSIZE - 1;
+  while (*iM > *im && freq[*iM] == 0) (*iM)--;
+
+  if (*im > *iM) {
+    *im = *iM = 0;
+    return true;
+  }
+
+  // Limit encoding to prevent overflow (use 20-bit safe threshold)
+  // This ensures we don't exceed 58-bit code lengths
+  int nSymbols = *iM - *im + 1;
+
+  // Build Huffman tree using heap
+  std::vector<int64_t*> heap;
+  heap.reserve(nSymbols + 1);
+
+  // Add all non-zero frequency symbols to heap
+  for (int i = *im; i <= *iM; i++) {
+    heap.push_back(&freq[i]);
+  }
+  std::make_heap(heap.begin(), heap.end(), HufHeapCompare());
+
+  // Build tree
+  std::vector<int64_t> tree_storage(nSymbols);
+  int64_t* tree_next = tree_storage.data();
+
+  while (heap.size() > 1) {
+    // Pop two smallest
+    std::pop_heap(heap.begin(), heap.end(), HufHeapCompare());
+    int64_t* a = heap.back(); heap.pop_back();
+
+    std::pop_heap(heap.begin(), heap.end(), HufHeapCompare());
+    int64_t* b = heap.back(); heap.pop_back();
+
+    // Create parent node
+    *tree_next = *a + *b;
+
+    // Mark children with depth increment
+    // Store depth in high 6 bits, frequency is lost but we don't need it
+    *a = (*a & ~0x3FULL) | ((*a & 0x3F) + 1);
+    *b = (*b & ~0x3FULL) | ((*b & 0x3F) + 1);
+
+    heap.push_back(tree_next);
+    std::push_heap(heap.begin(), heap.end(), HufHeapCompare());
+    tree_next++;
+  }
+
+  // Extract code lengths (stored in low 6 bits)
+  for (int i = *im; i <= *iM; i++) {
+    int length = static_cast<int>(freq[i] & 0x3F);
+    if (length > 58) length = 58;  // Clamp to max
+    freq[i] = length;
+  }
+
+  // Convert lengths to canonical codes
+  hufCanonicalCodeTable(freq);
+  return true;
+}
+
+// Output n bits to buffer
+inline void outputBits(int nBits, int64_t bits, int64_t& c, int& lc, uint8_t*& out) {
+  c = (c << nBits) | bits;
+  lc += nBits;
+  while (lc >= 8) {
+    lc -= 8;
+    *out++ = static_cast<uint8_t>(c >> lc);
+  }
+}
+
+// Output Huffman code
+inline void outputCode(int64_t code, int64_t& c, int& lc, uint8_t*& out) {
+  int length = static_cast<int>(code & 63);
+  int64_t bits = code >> 6;
+  outputBits(length, bits, c, lc, out);
+}
+
+// Send code with optional run-length encoding
+inline void sendCode(int64_t sCode, int runCount, int64_t runCode,
+                     int64_t& c, int& lc, uint8_t*& out) {
+  int sLen = static_cast<int>(sCode & 63);
+  int rlcLen = static_cast<int>(runCode & 63);
+
+  // Check if RLC is more efficient
+  if (sLen + rlcLen + 8 < sLen * (runCount + 1)) {
+    outputCode(sCode, c, lc, out);
+    outputCode(runCode, c, lc, out);
+    outputBits(8, runCount, c, lc, out);
+  } else {
+    for (int i = 0; i <= runCount; i++) {
+      outputCode(sCode, c, lc, out);
+    }
+  }
+}
+
+// Encode data using Huffman codes
+// Returns output size in bits
+inline int hufEncode(const int64_t* hcode, const uint16_t* in, int ni, int rlc, uint8_t* out) {
+  uint8_t* outStart = out;
+  int64_t c = 0;
+  int lc = 0;
+
+  if (ni == 0) return 0;
+
+  int s = in[0];
+  int cs = 0;
+
+  for (int i = 1; i < ni; i++) {
+    if (s == in[i] && cs < 255) {
+      cs++;
+    } else {
+      sendCode(hcode[s], cs, hcode[rlc], c, lc, out);
+      cs = 0;
+    }
+    s = in[i];
+  }
+
+  // Send remaining code
+  sendCode(hcode[s], cs, hcode[rlc], c, lc, out);
+
+  // Flush remaining bits
+  if (lc) {
+    *out++ = static_cast<uint8_t>((c << (8 - lc)) & 0xFF);
+  }
+
+  return static_cast<int>((out - outStart) * 8 + lc);
+}
+
+// Pack encoding table for storage
+// Uses run-length encoding for zero-length codes
+inline void hufPackEncTable(const int64_t* hcode, int im, int iM, uint8_t*& out) {
+  int64_t c = 0;
+  int lc = 0;
+
+  for (int i = im; i <= iM; i++) {
+    int l = static_cast<int>(hcode[i] & 63);
+
+    if (l == 0) {
+      // Count consecutive zeros
+      int zerun = 1;
+      while (i + zerun <= iM && (hcode[i + zerun] & 63) == 0 && zerun < 255) {
+        zerun++;
+      }
+
+      if (zerun >= SHORTEST_LONG_RUN) {
+        outputBits(6, LONG_ZEROCODE_RUN, c, lc, out);
+        outputBits(8, zerun - SHORTEST_LONG_RUN, c, lc, out);
+        i += zerun - 1;
+      } else if (zerun >= 2) {
+        outputBits(6, SHORT_ZEROCODE_RUN + zerun - 2, c, lc, out);
+        i += zerun - 1;
+      } else {
+        outputBits(6, 0, c, lc, out);
+      }
+    } else {
+      outputBits(6, l, c, lc, out);
+    }
+  }
+
+  // Flush remaining bits
+  if (lc) {
+    *out++ = static_cast<uint8_t>((c << (8 - lc)) & 0xFF);
+  }
+}
+
+// Huffman compress uint16 data
+// Returns compressed size, or 0 on failure
+inline int hufCompress(const uint16_t* raw, int nRaw, uint8_t* compressed) {
+  if (nRaw == 0) return 0;
+
+  std::vector<int64_t> freq(HUF_ENCSIZE);
+
+  countFrequencies(freq.data(), raw, nRaw);
+
+  int im = 0, iM = 0;
+  if (!hufBuildEncTable(freq.data(), &im, &iM)) {
+    return 0;  // Encoding failed
+  }
+
+  // Write header: im, iM, tableLength, nBits, reserved
+  uint8_t* tableStart = compressed + 20;
+  uint8_t* tableEnd = tableStart;
+  hufPackEncTable(freq.data(), im, iM, tableEnd);
+  int tableLength = static_cast<int>(tableEnd - tableStart);
+
+  uint8_t* dataStart = tableEnd;
+  int nBits = hufEncode(freq.data(), raw, nRaw, iM, dataStart);
+  int dataLength = (nBits + 7) / 8;
+
+  // Write header
+  std::memcpy(compressed, &im, 4);
+  std::memcpy(compressed + 4, &iM, 4);
+  std::memcpy(compressed + 8, &tableLength, 4);
+  std::memcpy(compressed + 12, &nBits, 4);
+  int zero = 0;
+  std::memcpy(compressed + 16, &zero, 4);  // Reserved
+
+  return static_cast<int>(dataStart + dataLength - compressed);
+}
+
+// ============================================================================
+// PIZ Compression (V2 API)
 // ============================================================================
 
 // Compress data using PIZ algorithm
@@ -1381,13 +1606,192 @@ inline tinyexr::v2::Result<size_t> CompressPizV2(
 
   using namespace tinyexr::v2;
 
-  // TODO: Implement in Phase 2 with FastHuffmanEncoder
-  return Result<size_t>::error(ErrorInfo(
-    ErrorCode::UnsupportedFormat,
-    "PIZ compression not yet implemented in V2",
-    "CompressPizV2",
-    0
-  ));
+  // Validate input
+  if (!dst || !src || !channels) {
+    return Result<size_t>::error(ErrorInfo(
+      ErrorCode::InvalidArgument,
+      "PIZ null pointer argument",
+      "CompressPizV2", 0
+    ));
+  }
+
+  if (numChannels <= 0 || dataWidth <= 0 || numLines <= 0) {
+    return Result<size_t>::error(ErrorInfo(
+      ErrorCode::InvalidArgument,
+      "PIZ invalid dimensions",
+      "CompressPizV2", 0
+    ));
+  }
+
+  // srcSize should be multiple of 2 (uint16 data)
+  if (srcSize == 0 || srcSize % 2 != 0) {
+    return Result<size_t>::error(ErrorInfo(
+      ErrorCode::InvalidArgument,
+      "PIZ source size must be even",
+      "CompressPizV2", 0
+    ));
+  }
+
+  // Allocate temporary buffer for channel data
+  std::vector<uint16_t> tmpBuffer(srcSize / sizeof(uint16_t));
+
+  // Set up channel data structures
+  std::vector<PIZChannelData> channelData(numChannels);
+  uint16_t* tmpBufferEnd = tmpBuffer.data();
+
+  for (int c = 0; c < numChannels; c++) {
+    PIZChannelData& cd = channelData[c];
+
+    cd.start = tmpBufferEnd;
+    cd.end = cd.start;
+
+    // Account for subsampling
+    int x_samp = channels[c].x_sampling > 0 ? channels[c].x_sampling : 1;
+    int y_samp = channels[c].y_sampling > 0 ? channels[c].y_sampling : 1;
+    cd.nx = dataWidth / x_samp;
+    cd.ny = numLines / y_samp;
+    if ((numLines % y_samp) != 0) cd.ny++;
+    if ((dataWidth % x_samp) != 0) cd.nx++;
+
+    // Pixel size in uint16 units (1 for HALF, 2 for FLOAT/UINT)
+    cd.size = (channels[c].pixel_type == 1) ? 1 : 2;  // 1 = HALF
+
+    tmpBufferEnd += static_cast<size_t>(cd.nx) * cd.ny * cd.size;
+  }
+
+  // Verify we have enough source data
+  size_t expectedSize = (tmpBufferEnd - tmpBuffer.data()) * sizeof(uint16_t);
+  if (srcSize < expectedSize) {
+    return Result<size_t>::error(ErrorInfo(
+      ErrorCode::InvalidArgument,
+      "PIZ source size too small: need " + std::to_string(expectedSize) +
+      " but got " + std::to_string(srcSize),
+      "CompressPizV2", 0
+    ));
+  }
+
+  // Copy input data to temp buffer (de-interleave by channel)
+  const uint8_t* ptr = src;
+  for (int y = 0; y < numLines; ++y) {
+    for (int c = 0; c < numChannels; ++c) {
+      PIZChannelData& cd = channelData[c];
+
+      // Check if this line has data for this channel (subsampling)
+      int y_samp = channels[c].y_sampling > 0 ? channels[c].y_sampling : 1;
+      if ((y % y_samp) != 0) continue;
+
+      size_t n = static_cast<size_t>(cd.nx) * cd.size;
+      std::memcpy(cd.end, ptr, n * sizeof(uint16_t));
+      ptr += n * sizeof(uint16_t);
+      cd.end += n;
+    }
+  }
+
+  // Build bitmap and forward LUT (range compression)
+  std::vector<uint8_t> bitmap(BITMAP_SIZE, 0);
+  uint16_t minNonZero, maxNonZero;
+  bitmapFromData(tmpBuffer.data(), static_cast<int>(tmpBuffer.size()),
+                 bitmap.data(), minNonZero, maxNonZero);
+
+  std::vector<uint16_t> lut(USHORT_RANGE);
+  uint16_t maxValue = forwardLutFromBitmap(bitmap.data(), lut.data());
+
+  // Apply forward LUT to compress value range
+  applyLut(lut.data(), tmpBuffer.data(), static_cast<int>(tmpBuffer.size()));
+
+  // Apply wavelet encoding
+  for (int c = 0; c < numChannels; ++c) {
+    PIZChannelData& cd = channelData[c];
+    for (int j = 0; j < cd.size; ++j) {
+      wav2Encode(cd.start + j, cd.nx, cd.size, cd.ny, cd.nx * cd.size, maxValue);
+    }
+  }
+
+  // Write output: bitmap range, bitmap data, Huffman length, Huffman data
+  uint8_t* buf = dst;
+  uint8_t* bufEnd = dst + dstCapacity;
+
+  // Write minNonZero and maxNonZero
+  if (buf + 4 > bufEnd) {
+    return Result<size_t>::error(ErrorInfo(
+      ErrorCode::CompressionError,
+      "PIZ output buffer too small for header",
+      "CompressPizV2", 0
+    ));
+  }
+  std::memcpy(buf, &minNonZero, sizeof(uint16_t));
+  buf += sizeof(uint16_t);
+  std::memcpy(buf, &maxNonZero, sizeof(uint16_t));
+  buf += sizeof(uint16_t);
+
+  // Write bitmap slice
+  if (minNonZero <= maxNonZero) {
+    size_t bitmapLen = maxNonZero - minNonZero + 1;
+    if (buf + bitmapLen > bufEnd) {
+      return Result<size_t>::error(ErrorInfo(
+        ErrorCode::CompressionError,
+        "PIZ output buffer too small for bitmap",
+        "CompressPizV2", 0
+      ));
+    }
+    std::memcpy(buf, &bitmap[minNonZero], bitmapLen);
+    buf += bitmapLen;
+  }
+
+  // Reserve space for Huffman length
+  if (buf + 4 > bufEnd) {
+    return Result<size_t>::error(ErrorInfo(
+      ErrorCode::CompressionError,
+      "PIZ output buffer too small for Huffman length",
+      "CompressPizV2", 0
+    ));
+  }
+  uint8_t* lengthPtr = buf;
+  int zero = 0;
+  std::memcpy(buf, &zero, sizeof(int));
+  buf += sizeof(int);
+
+  // Huffman compress
+  size_t remainingCapacity = bufEnd - buf;
+  // Estimate max Huffman output size (header + table + data)
+  // Huffman has 20-byte header + table + encoded data
+  if (remainingCapacity < 20 + tmpBuffer.size() * 2) {
+    return Result<size_t>::error(ErrorInfo(
+      ErrorCode::CompressionError,
+      "PIZ output buffer too small for Huffman data",
+      "CompressPizV2", 0
+    ));
+  }
+
+  int huffLen = hufCompress(tmpBuffer.data(), static_cast<int>(tmpBuffer.size()), buf);
+  if (huffLen <= 0) {
+    return Result<size_t>::error(ErrorInfo(
+      ErrorCode::CompressionError,
+      "PIZ Huffman compression failed",
+      "CompressPizV2", 0
+    ));
+  }
+
+  // Write Huffman length
+  std::memcpy(lengthPtr, &huffLen, sizeof(int));
+  buf += huffLen;
+
+  size_t outSize = buf - dst;
+
+  // If compressed is larger than original, return uncompressed (Issue 40)
+  if (outSize >= srcSize) {
+    if (dstCapacity < srcSize) {
+      return Result<size_t>::error(ErrorInfo(
+        ErrorCode::CompressionError,
+        "PIZ output buffer too small for uncompressed fallback",
+        "CompressPizV2", 0
+      ));
+    }
+    std::memcpy(dst, src, srcSize);
+    return Result<size_t>::ok(srcSize);
+  }
+
+  return Result<size_t>::ok(outSize);
 }
 
 }  // namespace piz

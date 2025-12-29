@@ -3389,24 +3389,26 @@ Result<std::vector<uint8_t>> SaveToMemory(const ImageData& image, int compressio
         break;
       }
 
-      case COMPRESSION_PIZ:
-        // PIZ compression is more complex - for now fall back to ZIP
-        // TODO: Implement PIZ compression using tinyexr_compress.hh
-#if defined(TINYEXR_USE_MINIZ) || defined(TINYEXR_USE_ZLIB)
-        ReorderBytesForCompression(scanline_buffer.data(), reorder_buffer.data(), actual_bytes);
-        ApplyDeltaPredictorEncode(reorder_buffer.data(), actual_bytes);
-        if (!CompressZip(reorder_buffer.data(), actual_bytes, compress_buffer, compression_level)) {
-          compressed_size = actual_bytes;
-          data_to_write = scanline_buffer.data();
-        } else {
-          compressed_size = compress_buffer.size();
-          data_to_write = compress_buffer.data();
+      case COMPRESSION_PIZ: {
+        // PIZ compression: wavelet + Huffman
+        // Ensure output buffer is large enough (worst case: uncompressed + overhead)
+        compress_buffer.resize(actual_bytes + actual_bytes / 100 + 1024);
+        auto piz_result = tinyexr::piz::CompressPizV2(
+            compress_buffer.data(), compress_buffer.size(),
+            scanline_buffer.data(), actual_bytes,
+            static_cast<int>(sorted_channels.size()),
+            sorted_channels.data(),
+            width, num_lines);
+        if (!piz_result.success) {
+          return Result<std::vector<uint8_t>>::error(
+            ErrorInfo(ErrorCode::CompressionError,
+                      "PIZ compression failed: " + piz_result.error_string(),
+                      "SaveToMemory", writer.tell()));
         }
-#else
-        compressed_size = actual_bytes;
-        data_to_write = scanline_buffer.data();
-#endif
+        compressed_size = piz_result.value;
+        data_to_write = compress_buffer.data();
         break;
+      }
 
       case COMPRESSION_B44:
         // B44 compression - only works with HALF pixel types
@@ -3682,22 +3684,25 @@ static bool WriteTile(Writer& writer, const float* image_data,
 #endif
       break;
 
-    case COMPRESSION_PIZ:
-#if defined(TINYEXR_USE_MINIZ) || defined(TINYEXR_USE_ZLIB)
-      ReorderBytesForCompression(tile_buffer.data(), reorder_buffer.data(), actual_tile_size);
-      ApplyDeltaPredictorEncode(reorder_buffer.data(), actual_tile_size);
-      if (!CompressZip(reorder_buffer.data(), actual_tile_size, compress_buffer, compression_level)) {
+    case COMPRESSION_PIZ: {
+      // PIZ compression: wavelet + Huffman
+      compress_buffer.resize(actual_tile_size + actual_tile_size / 100 + 1024);
+      auto piz_result = tinyexr::piz::CompressPizV2(
+          compress_buffer.data(), compress_buffer.size(),
+          tile_buffer.data(), actual_tile_size,
+          static_cast<int>(sorted_channels.size()),
+          sorted_channels.data(),
+          actual_w, actual_h);
+      if (!piz_result.success) {
+        // Fall back to uncompressed on error
         compressed_size = actual_tile_size;
         data_to_write = tile_buffer.data();
       } else {
-        compressed_size = compress_buffer.size();
+        compressed_size = piz_result.value;
         data_to_write = compress_buffer.data();
       }
-#else
-      compressed_size = actual_tile_size;
-      data_to_write = tile_buffer.data();
-#endif
       break;
+    }
 
     case COMPRESSION_B44:
       if (!CompressB44V2(tile_buffer.data(), actual_tile_size,

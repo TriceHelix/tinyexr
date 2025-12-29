@@ -2003,3 +2003,128 @@ TEST_CASE("v2: LoadOptions - default (no raw channels)", "[v2][loadoptions]") {
   // RGBA should still work
   REQUIRE(img.rgba.size() == static_cast<size_t>(width) * height * 4);
 }
+
+// =============================================================================
+// PIZ Compression Round-Trip Tests (Phase 6)
+// =============================================================================
+
+TEST_CASE("v2: PIZ compression round-trip", "[v2][piz][compression]") {
+  using namespace tinyexr::v2;
+
+  const int width = 64;
+  const int height = 64;
+
+  // Create test image
+  ImageData original;
+  original.width = width;
+  original.height = height;
+  original.num_channels = 4;
+  original.rgba.resize(width * height * 4);
+
+  // Fill with test pattern (gradient + noise for realistic compression)
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      int idx = (y * width + x) * 4;
+      original.rgba[idx + 0] = static_cast<float>(x) / width;
+      original.rgba[idx + 1] = static_cast<float>(y) / height;
+      original.rgba[idx + 2] = 0.5f + 0.1f * std::sin(x * 0.1f);
+      original.rgba[idx + 3] = 1.0f;
+    }
+  }
+
+  original.header.compression = tinyexr::v2::COMPRESSION_PIZ;
+  original.header.data_window.min_x = 0;
+  original.header.data_window.min_y = 0;
+  original.header.data_window.max_x = width - 1;
+  original.header.data_window.max_y = height - 1;
+  original.header.display_window = original.header.data_window;
+  original.header.pixel_aspect_ratio = 1.0f;
+  original.header.screen_window_width = 1.0f;
+  original.header.line_order = 0;
+
+  Channel ch_r, ch_g, ch_b, ch_a;
+  ch_r.name = "R"; ch_r.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_r.x_sampling = 1; ch_r.y_sampling = 1;
+  ch_g.name = "G"; ch_g.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_g.x_sampling = 1; ch_g.y_sampling = 1;
+  ch_b.name = "B"; ch_b.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_b.x_sampling = 1; ch_b.y_sampling = 1;
+  ch_a.name = "A"; ch_a.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_a.x_sampling = 1; ch_a.y_sampling = 1;
+  original.header.channels.push_back(ch_a);
+  original.header.channels.push_back(ch_b);
+  original.header.channels.push_back(ch_g);
+  original.header.channels.push_back(ch_r);
+
+  // Save with PIZ compression
+  auto save_result = SaveToMemory(original, 6);
+  REQUIRE(save_result.success);
+  INFO("PIZ: Saved " << save_result.value.size() << " bytes");
+
+  // Load back
+  auto load_result = LoadFromMemory(save_result.value.data(), save_result.value.size());
+  REQUIRE(load_result.success);
+
+  const auto& loaded = load_result.value;
+  REQUIRE(loaded.width == width);
+  REQUIRE(loaded.height == height);
+  REQUIRE(loaded.rgba.size() == original.rgba.size());
+
+  // Check pixel values (allowing for HALF precision loss)
+  int errors = 0;
+  for (size_t i = 0; i < original.rgba.size(); i++) {
+    float diff = std::abs(original.rgba[i] - loaded.rgba[i]);
+    if (diff > 0.01f) errors++;
+  }
+
+  INFO("PIZ: Pixel errors: " << errors << "/" << original.rgba.size());
+  REQUIRE(errors == 0);
+}
+
+TEST_CASE("v2: PIZ compression all zeros (issue 194)", "[v2][piz][compression]") {
+  using namespace tinyexr::v2;
+
+  const int width = 16;
+  const int height = 16;
+
+  // Create image with all zeros
+  ImageData original;
+  original.width = width;
+  original.height = height;
+  original.num_channels = 4;
+  original.rgba.resize(width * height * 4, 0.0f);
+
+  original.header.compression = tinyexr::v2::COMPRESSION_PIZ;
+  original.header.data_window.min_x = 0;
+  original.header.data_window.min_y = 0;
+  original.header.data_window.max_x = width - 1;
+  original.header.data_window.max_y = height - 1;
+  original.header.display_window = original.header.data_window;
+  original.header.pixel_aspect_ratio = 1.0f;
+  original.header.screen_window_width = 1.0f;
+  original.header.line_order = 0;
+
+  Channel ch_r, ch_g, ch_b, ch_a;
+  ch_r.name = "R"; ch_r.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_r.x_sampling = 1; ch_r.y_sampling = 1;
+  ch_g.name = "G"; ch_g.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_g.x_sampling = 1; ch_g.y_sampling = 1;
+  ch_b.name = "B"; ch_b.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_b.x_sampling = 1; ch_b.y_sampling = 1;
+  ch_a.name = "A"; ch_a.pixel_type = tinyexr::v2::PIXEL_TYPE_HALF; ch_a.x_sampling = 1; ch_a.y_sampling = 1;
+  original.header.channels.push_back(ch_a);
+  original.header.channels.push_back(ch_b);
+  original.header.channels.push_back(ch_g);
+  original.header.channels.push_back(ch_r);
+
+  // Save with PIZ compression
+  auto save_result = SaveToMemory(original, 6);
+  REQUIRE(save_result.success);
+  INFO("PIZ zeros: Saved " << save_result.value.size() << " bytes");
+
+  // Load back
+  auto load_result = LoadFromMemory(save_result.value.data(), save_result.value.size());
+  REQUIRE(load_result.success);
+
+  const auto& loaded = load_result.value;
+  REQUIRE(loaded.width == width);
+  REQUIRE(loaded.height == height);
+
+  // All pixels should still be zero
+  for (size_t i = 0; i < loaded.rgba.size(); i++) {
+    REQUIRE(loaded.rgba[i] == 0.0f);
+  }
+}
