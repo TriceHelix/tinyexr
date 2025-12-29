@@ -6617,6 +6617,739 @@ Result<MultipartImageData> LoadMultipartFromMemory(const uint8_t* data, size_t s
   return Result<MultipartImageData>::ok(mp_data);
 }
 
+// ============================================================================
+// Spectral Image I/O
+// ============================================================================
+
+// Check if header contains spectral layout attributes
+bool IsSpectralEXR(const Header& header) {
+  return header.has_attribute("spectralLayoutVersion");
+}
+
+// Save spectral image to memory
+Result<std::vector<uint8_t>> SaveSpectralToMemory(const SpectralImageData& spectral, int compression_level) {
+  if (spectral.width <= 0 || spectral.height <= 0) {
+    return Result<std::vector<uint8_t>>::error(
+      ErrorInfo(ErrorCode::InvalidArgument, "Invalid spectral image dimensions",
+                "SaveSpectralToMemory", 0));
+  }
+
+  if (spectral.wavelengths.empty()) {
+    return Result<std::vector<uint8_t>>::error(
+      ErrorInfo(ErrorCode::InvalidArgument, "No wavelengths specified",
+                "SaveSpectralToMemory", 0));
+  }
+
+  bool is_polarised = (spectral.spectrum_type & SPECTRUM_POLARISED) != 0;
+  bool is_reflective = (spectral.spectrum_type & SPECTRUM_REFLECTIVE) != 0 &&
+                       (spectral.spectrum_type & SPECTRUM_EMISSIVE) == 0;
+
+  // Verify data size
+  size_t num_pixels = static_cast<size_t>(spectral.width) * spectral.height;
+  size_t num_wavelengths = spectral.wavelengths.size();
+
+  if (is_polarised) {
+    if (spectral.stokes_data.size() != 4) {
+      return Result<std::vector<uint8_t>>::error(
+        ErrorInfo(ErrorCode::InvalidArgument,
+                  "Polarised image requires 4 Stokes components",
+                  "SaveSpectralToMemory", 0));
+    }
+    for (size_t s = 0; s < 4; s++) {
+      if (spectral.stokes_data[s].size() != num_wavelengths) {
+        return Result<std::vector<uint8_t>>::error(
+          ErrorInfo(ErrorCode::InvalidArgument,
+                    "Stokes component " + std::to_string(s) + " wavelength count mismatch",
+                    "SaveSpectralToMemory", 0));
+      }
+      for (size_t w = 0; w < num_wavelengths; w++) {
+        if (spectral.stokes_data[s][w].size() != num_pixels) {
+          return Result<std::vector<uint8_t>>::error(
+            ErrorInfo(ErrorCode::InvalidArgument,
+                      "Stokes " + std::to_string(s) + " wavelength " + std::to_string(w) +
+                      " pixel count mismatch",
+                      "SaveSpectralToMemory", 0));
+        }
+      }
+    }
+  } else {
+    if (spectral.spectral_data.size() != num_wavelengths) {
+      return Result<std::vector<uint8_t>>::error(
+        ErrorInfo(ErrorCode::InvalidArgument,
+                  "Spectral data wavelength count mismatch",
+                  "SaveSpectralToMemory", 0));
+    }
+    for (size_t w = 0; w < num_wavelengths; w++) {
+      if (spectral.spectral_data[w].size() != num_pixels) {
+        return Result<std::vector<uint8_t>>::error(
+          ErrorInfo(ErrorCode::InvalidArgument,
+                    "Wavelength " + std::to_string(w) + " pixel count mismatch",
+                    "SaveSpectralToMemory", 0));
+      }
+    }
+  }
+
+  // Build ImageData with spectral channels
+  ImageData image;
+  image.width = spectral.width;
+  image.height = spectral.height;
+  image.header = spectral.header;
+
+  // Set up header
+  if (image.header.data_window.max_x == 0 && image.header.data_window.max_y == 0) {
+    image.header.data_window.min_x = 0;
+    image.header.data_window.min_y = 0;
+    image.header.data_window.max_x = spectral.width - 1;
+    image.header.data_window.max_y = spectral.height - 1;
+    image.header.display_window = image.header.data_window;
+  }
+  if (image.header.pixel_aspect_ratio <= 0.0f) {
+    image.header.pixel_aspect_ratio = 1.0f;
+  }
+  if (image.header.screen_window_width <= 0.0f) {
+    image.header.screen_window_width = 1.0f;
+  }
+  if (image.header.compression == COMPRESSION_NONE) {
+    image.header.compression = COMPRESSION_ZIP;
+  }
+
+  // Clear existing channels and rebuild
+  image.header.channels.clear();
+
+  // Add RGB preview channels first (if available)
+  bool has_rgb = !spectral.rgb_preview.empty() &&
+                 spectral.rgb_preview.size() == num_pixels * 3;
+  if (has_rgb) {
+    Channel ch_r, ch_g, ch_b;
+    ch_r.name = "R"; ch_r.pixel_type = PIXEL_TYPE_FLOAT; ch_r.x_sampling = 1; ch_r.y_sampling = 1;
+    ch_g.name = "G"; ch_g.pixel_type = PIXEL_TYPE_FLOAT; ch_g.x_sampling = 1; ch_g.y_sampling = 1;
+    ch_b.name = "B"; ch_b.pixel_type = PIXEL_TYPE_FLOAT; ch_b.x_sampling = 1; ch_b.y_sampling = 1;
+    image.header.channels.push_back(ch_b);
+    image.header.channels.push_back(ch_g);
+    image.header.channels.push_back(ch_r);
+  }
+
+  // Add spectral channels
+  if (is_polarised) {
+    // Stokes components S0-S3 for each wavelength
+    for (int s = 0; s < 4; s++) {
+      for (size_t w = 0; w < num_wavelengths; w++) {
+        Channel ch;
+        ch.name = SpectralChannelName(spectral.wavelengths[w], s);
+        ch.pixel_type = PIXEL_TYPE_FLOAT;
+        ch.x_sampling = 1;
+        ch.y_sampling = 1;
+        image.header.channels.push_back(ch);
+      }
+    }
+  } else {
+    // Single component per wavelength
+    for (size_t w = 0; w < num_wavelengths; w++) {
+      Channel ch;
+      if (is_reflective) {
+        ch.name = ReflectiveChannelName(spectral.wavelengths[w]);
+      } else {
+        ch.name = SpectralChannelName(spectral.wavelengths[w], 0);
+      }
+      ch.pixel_type = PIXEL_TYPE_FLOAT;
+      ch.x_sampling = 1;
+      ch.y_sampling = 1;
+      image.header.channels.push_back(ch);
+    }
+  }
+
+  // Sort channels by name (EXR requirement)
+  std::sort(image.header.channels.begin(), image.header.channels.end(),
+            [](const Channel& a, const Channel& b) { return a.name < b.name; });
+
+  // Build RGBA data (we'll use a custom approach since SaveToMemory expects RGBA)
+  // Instead, we'll build the raw channel data directly
+
+  // Calculate total channels
+  size_t total_channels = image.header.channels.size();
+  image.num_channels = static_cast<int>(total_channels);
+
+  // Create rgba array - but this is tricky since SaveToMemory expects RGBA format
+  // We need to pack spectral data appropriately
+  // For simplicity, let's use a modified approach: pack all channel data into rgba
+
+  // Actually, let's create a custom save that handles spectral data directly
+  // by using the raw channel format
+
+  // Build raw pixel data per channel (sorted by channel name)
+  std::vector<std::vector<float>> channel_data(total_channels);
+  for (size_t c = 0; c < total_channels; c++) {
+    channel_data[c].resize(num_pixels);
+    const std::string& ch_name = image.header.channels[c].name;
+
+    if (ch_name == "R" && has_rgb) {
+      for (size_t i = 0; i < num_pixels; i++) {
+        channel_data[c][i] = spectral.rgb_preview[i * 3 + 0];
+      }
+    } else if (ch_name == "G" && has_rgb) {
+      for (size_t i = 0; i < num_pixels; i++) {
+        channel_data[c][i] = spectral.rgb_preview[i * 3 + 1];
+      }
+    } else if (ch_name == "B" && has_rgb) {
+      for (size_t i = 0; i < num_pixels; i++) {
+        channel_data[c][i] = spectral.rgb_preview[i * 3 + 2];
+      }
+    } else {
+      // Spectral channel
+      float wl = ParseSpectralChannelWavelength(ch_name);
+      int stokes = GetStokesComponent(ch_name);
+
+      // Find wavelength index
+      int wl_idx = -1;
+      for (size_t w = 0; w < num_wavelengths; w++) {
+        if (std::abs(spectral.wavelengths[w] - wl) < 0.001f) {
+          wl_idx = static_cast<int>(w);
+          break;
+        }
+      }
+
+      if (wl_idx >= 0) {
+        if (is_polarised && stokes >= 0 && stokes < 4) {
+          channel_data[c] = spectral.stokes_data[stokes][wl_idx];
+        } else if (!is_polarised) {
+          channel_data[c] = spectral.spectral_data[wl_idx];
+        }
+      }
+    }
+  }
+
+  // Now pack into RGBA format expected by SaveToMemory
+  // We need to create an image with all channels as "RGBA"
+  // Actually, SaveToMemory uses the header.channels for writing, not just RGBA
+  // So we need to populate image.rgba with the interleaved channel data
+
+  // For spectral data, use raw data approach
+  // Pack channels in sorted order (which they already are in channel_data)
+  image.rgba.resize(num_pixels * 4, 0.0f);  // RGBA for compatibility
+
+  // Since SaveToMemory writes data based on header.channels, we need a different approach
+  // Let's write directly using a custom spectral writer
+
+  // Actually, we can reuse SaveToMemory by ensuring rgba contains data for all channels
+  // The issue is SaveToMemory expects rgba to be in a specific format
+
+  // Let's create a simplified approach: convert spectral to ImageData with raw_channels
+  // and use a modified save
+
+  // For now, let's just fill rgba with the first 4 spectral bands as a workaround
+  // and rely on the existing SaveToMemory which writes based on header.channels
+
+  // Better approach: Create the output directly similar to SaveToMemory
+  // but with proper handling of FLOAT channels
+
+  std::vector<uint8_t> output;
+  output.reserve(1024 * 1024);
+
+  // Helper lambdas for writing
+  auto write_bytes = [&output](const void* data, size_t len) {
+    const uint8_t* ptr = static_cast<const uint8_t*>(data);
+    output.insert(output.end(), ptr, ptr + len);
+  };
+
+  auto write_string = [&output](const std::string& s) {
+    output.insert(output.end(), s.begin(), s.end());
+    output.push_back(0);
+  };
+
+  auto write_u32 = [&output](uint32_t v) {
+    output.push_back(static_cast<uint8_t>(v & 0xFF));
+    output.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+    output.push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
+    output.push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
+  };
+
+  auto write_float = [&output](float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    output.push_back(static_cast<uint8_t>(u & 0xFF));
+    output.push_back(static_cast<uint8_t>((u >> 8) & 0xFF));
+    output.push_back(static_cast<uint8_t>((u >> 16) & 0xFF));
+    output.push_back(static_cast<uint8_t>((u >> 24) & 0xFF));
+  };
+
+  auto write_attribute = [&](const std::string& name, const std::string& type,
+                              const void* data, size_t size) {
+    write_string(name);
+    write_string(type);
+    write_u32(static_cast<uint32_t>(size));
+    write_bytes(data, size);
+  };
+
+  // Write magic number
+  output.push_back(0x76);
+  output.push_back(0x2f);
+  output.push_back(0x31);
+  output.push_back(0x01);
+
+  // Write version (scanline, not tiled)
+  uint32_t version_bits = 2;  // version 2
+  output.push_back(static_cast<uint8_t>(version_bits & 0xFF));
+  output.push_back(static_cast<uint8_t>((version_bits >> 8) & 0xFF));
+  output.push_back(static_cast<uint8_t>((version_bits >> 16) & 0xFF));
+  output.push_back(static_cast<uint8_t>((version_bits >> 24) & 0xFF));
+
+  // Write header attributes manually
+
+  // channels (chlist)
+  {
+    std::vector<uint8_t> chlist;
+    for (const auto& ch : image.header.channels) {
+      for (char c : ch.name) chlist.push_back(static_cast<uint8_t>(c));
+      chlist.push_back(0);
+      uint32_t pt = ch.pixel_type;
+      chlist.push_back(static_cast<uint8_t>(pt & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((pt >> 8) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((pt >> 16) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((pt >> 24) & 0xFF));
+      chlist.push_back(0); chlist.push_back(0);
+      chlist.push_back(0); chlist.push_back(0);
+      int32_t xs = ch.x_sampling > 0 ? ch.x_sampling : 1;
+      chlist.push_back(static_cast<uint8_t>(xs & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((xs >> 8) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((xs >> 16) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((xs >> 24) & 0xFF));
+      int32_t ys = ch.y_sampling > 0 ? ch.y_sampling : 1;
+      chlist.push_back(static_cast<uint8_t>(ys & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((ys >> 8) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((ys >> 16) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((ys >> 24) & 0xFF));
+    }
+    chlist.push_back(0);
+    write_attribute("channels", "chlist", chlist.data(), chlist.size());
+  }
+
+  // compression
+  {
+    uint8_t comp = static_cast<uint8_t>(image.header.compression);
+    write_attribute("compression", "compression", &comp, 1);
+  }
+
+  // dataWindow
+  {
+    int32_t dw[4] = {image.header.data_window.min_x, image.header.data_window.min_y,
+                     image.header.data_window.max_x, image.header.data_window.max_y};
+    write_attribute("dataWindow", "box2i", dw, 16);
+  }
+
+  // displayWindow
+  {
+    int32_t dw[4] = {image.header.display_window.min_x, image.header.display_window.min_y,
+                     image.header.display_window.max_x, image.header.display_window.max_y};
+    write_attribute("displayWindow", "box2i", dw, 16);
+  }
+
+  // lineOrder
+  {
+    uint8_t lo = static_cast<uint8_t>(image.header.line_order);
+    write_attribute("lineOrder", "lineOrder", &lo, 1);
+  }
+
+  // pixelAspectRatio
+  {
+    write_attribute("pixelAspectRatio", "float", &image.header.pixel_aspect_ratio, 4);
+  }
+
+  // screenWindowCenter
+  {
+    float swc[2] = {image.header.screen_window_center[0], image.header.screen_window_center[1]};
+    write_attribute("screenWindowCenter", "v2f", swc, 8);
+  }
+
+  // screenWindowWidth
+  {
+    write_attribute("screenWindowWidth", "float", &image.header.screen_window_width, 4);
+  }
+
+  // Custom attributes (includes spectral attributes)
+  for (const auto& attr : image.header.custom_attributes) {
+    if (attr.name.empty()) continue;
+    write_string(attr.name);
+    write_string(attr.type);
+    write_u32(static_cast<uint32_t>(attr.data.size()));
+    if (!attr.data.empty()) {
+      write_bytes(attr.data.data(), attr.data.size());
+    }
+  }
+
+  // End of header
+  output.push_back(0);
+
+  // Scanline blocks
+  int scanlines_per_block = GetScanlinesPerBlock(image.header.compression);
+  int num_blocks = (spectral.height + scanlines_per_block - 1) / scanlines_per_block;
+
+  // Reserve space for offset table
+  size_t offset_table_pos = output.size();
+  std::vector<uint64_t> block_offsets(static_cast<size_t>(num_blocks));
+  for (int i = 0; i < num_blocks; i++) {
+    for (int j = 0; j < 8; j++) {
+      output.push_back(0);  // Placeholder
+    }
+  }
+
+  // Calculate bytes per scanline
+  size_t bytes_per_scanline = 0;
+  for (const auto& ch : image.header.channels) {
+    int ch_bytes = (ch.pixel_type == PIXEL_TYPE_HALF) ? 2 : 4;
+    bytes_per_scanline += static_cast<size_t>(spectral.width) * ch_bytes;
+  }
+
+  // Buffers for compression
+  std::vector<uint8_t> scanline_buffer;
+  std::vector<uint8_t> reorder_buffer;
+  std::vector<uint8_t> compress_buffer;
+
+  int miniz_level = compression_level;
+  if (miniz_level < 1) miniz_level = 1;
+  if (miniz_level > 9) miniz_level = 9;
+
+  // Write each block
+  for (int block = 0; block < num_blocks; block++) {
+    block_offsets[static_cast<size_t>(block)] = output.size();
+
+    int block_start_y = block * scanlines_per_block;
+    int block_end_y = std::min(block_start_y + scanlines_per_block, spectral.height);
+    int num_lines = block_end_y - block_start_y;
+
+    size_t block_data_size = bytes_per_scanline * num_lines;
+    scanline_buffer.resize(block_data_size);
+
+    // Pack channel data into scanline buffer (channel by channel, line by line)
+    uint8_t* dst = scanline_buffer.data();
+    for (int y = block_start_y; y < block_end_y; y++) {
+      for (size_t c = 0; c < total_channels; c++) {
+        int ch_bytes = (image.header.channels[c].pixel_type == PIXEL_TYPE_HALF) ? 2 : 4;
+        for (int x = 0; x < spectral.width; x++) {
+          float val = channel_data[c][y * spectral.width + x];
+          if (ch_bytes == 2) {
+            uint16_t h = FloatToHalf(val);
+            std::memcpy(dst, &h, 2);
+            dst += 2;
+          } else {
+            std::memcpy(dst, &val, 4);
+            dst += 4;
+          }
+        }
+      }
+    }
+
+    // Compress
+    size_t compressed_size = block_data_size;
+    const uint8_t* data_to_write = scanline_buffer.data();
+
+    if (image.header.compression == COMPRESSION_ZIP ||
+        image.header.compression == COMPRESSION_ZIPS) {
+      reorder_buffer.resize(block_data_size);
+      ReorderBytesForCompression(scanline_buffer.data(), reorder_buffer.data(), block_data_size);
+      ApplyDeltaPredictorEncode(reorder_buffer.data(), block_data_size);
+
+#if defined(TINYEXR_USE_MINIZ)
+      compress_buffer.resize(block_data_size + block_data_size / 100 + 128);
+      mz_ulong comp_size = static_cast<mz_ulong>(compress_buffer.size());
+      int z_result = mz_compress2(compress_buffer.data(), &comp_size,
+                                  reorder_buffer.data(), static_cast<mz_ulong>(block_data_size),
+                                  miniz_level);
+      if (z_result == MZ_OK && comp_size < block_data_size) {
+        compressed_size = comp_size;
+        data_to_write = compress_buffer.data();
+      } else {
+        data_to_write = scanline_buffer.data();
+      }
+#elif defined(TINYEXR_USE_ZLIB)
+      compress_buffer.resize(compressBound(static_cast<uLong>(block_data_size)));
+      uLongf comp_size = static_cast<uLongf>(compress_buffer.size());
+      int z_result = compress2(compress_buffer.data(), &comp_size,
+                               reorder_buffer.data(), static_cast<uLong>(block_data_size),
+                               miniz_level);
+      if (z_result == Z_OK && comp_size < block_data_size) {
+        compressed_size = comp_size;
+        data_to_write = compress_buffer.data();
+      } else {
+        data_to_write = scanline_buffer.data();
+      }
+#else
+      data_to_write = scanline_buffer.data();
+#endif
+    }
+
+    // Write block: y_coord (4 bytes) + data_size (4 bytes) + data
+    int32_t y_coord = image.header.data_window.min_y + block_start_y;
+    uint32_t yu;
+    std::memcpy(&yu, &y_coord, 4);
+    output.push_back(static_cast<uint8_t>(yu & 0xFF));
+    output.push_back(static_cast<uint8_t>((yu >> 8) & 0xFF));
+    output.push_back(static_cast<uint8_t>((yu >> 16) & 0xFF));
+    output.push_back(static_cast<uint8_t>((yu >> 24) & 0xFF));
+
+    uint32_t data_size = static_cast<uint32_t>(compressed_size);
+    output.push_back(static_cast<uint8_t>(data_size & 0xFF));
+    output.push_back(static_cast<uint8_t>((data_size >> 8) & 0xFF));
+    output.push_back(static_cast<uint8_t>((data_size >> 16) & 0xFF));
+    output.push_back(static_cast<uint8_t>((data_size >> 24) & 0xFF));
+
+    output.insert(output.end(), data_to_write, data_to_write + compressed_size);
+  }
+
+  // Write offset table
+  for (int i = 0; i < num_blocks; i++) {
+    size_t offset_pos = offset_table_pos + static_cast<size_t>(i) * 8;
+    uint64_t offset = block_offsets[static_cast<size_t>(i)];
+    for (int j = 0; j < 8; j++) {
+      output[offset_pos + j] = static_cast<uint8_t>((offset >> (j * 8)) & 0xFF);
+    }
+  }
+
+  return Result<std::vector<uint8_t>>::ok(std::move(output));
+}
+
+Result<std::vector<uint8_t>> SaveSpectralToMemory(const SpectralImageData& spectral) {
+  return SaveSpectralToMemory(spectral, 6);
+}
+
+Result<void> SaveSpectralToFile(const char* filename, const SpectralImageData& spectral, int compression_level) {
+  if (!filename) {
+    return Result<void>::error(
+      ErrorInfo(ErrorCode::InvalidArgument, "Null filename",
+                "SaveSpectralToFile", 0));
+  }
+
+  auto mem_result = SaveSpectralToMemory(spectral, compression_level);
+  if (!mem_result.success) {
+    Result<void> result;
+    result.success = false;
+    result.errors = mem_result.errors;
+    result.warnings = mem_result.warnings;
+    return result;
+  }
+
+  FILE* fp = fopen(filename, "wb");
+  if (!fp) {
+    return Result<void>::error(
+      ErrorInfo(ErrorCode::IOError, "Failed to open file for writing",
+                filename, 0));
+  }
+
+  size_t written = fwrite(mem_result.value.data(), 1, mem_result.value.size(), fp);
+  fclose(fp);
+
+  if (written != mem_result.value.size()) {
+    return Result<void>::error(
+      ErrorInfo(ErrorCode::IOError, "Failed to write all data to file",
+                filename, 0));
+  }
+
+  Result<void> result = Result<void>::ok();
+  result.warnings = mem_result.warnings;
+  return result;
+}
+
+Result<SpectralImageData> LoadSpectralFromMemory(const uint8_t* data, size_t size) {
+  // First load as regular image with raw channels
+  LoadOptions opts;
+  opts.preserve_raw_channels = true;
+  opts.convert_to_rgba = false;
+
+  auto load_result = LoadFromMemory(data, size, opts);
+  if (!load_result.success) {
+    Result<SpectralImageData> result;
+    result.success = false;
+    result.errors = load_result.errors;
+    return result;
+  }
+
+  const ImageData& img = load_result.value;
+  SpectralImageData spectral;
+  spectral.width = img.width;
+  spectral.height = img.height;
+  spectral.header = img.header;
+
+  // Detect spectral channels and extract wavelengths
+  std::vector<float> wavelengths_set;
+  bool has_stokes[4] = {false, false, false, false};
+  bool is_reflective = false;
+
+  for (const auto& ch : img.header.channels) {
+    float wl = ParseSpectralChannelWavelength(ch.name);
+    if (wl > 0.0f) {
+      // Check if already in set
+      bool found = false;
+      for (float existing : wavelengths_set) {
+        if (std::abs(existing - wl) < 0.001f) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        wavelengths_set.push_back(wl);
+      }
+
+      int stokes = GetStokesComponent(ch.name);
+      if (stokes >= 0 && stokes < 4) {
+        has_stokes[stokes] = true;
+      } else if (stokes == -1) {
+        is_reflective = true;
+      }
+    }
+  }
+
+  if (wavelengths_set.empty()) {
+    return Result<SpectralImageData>::error(
+      ErrorInfo(ErrorCode::InvalidData, "No spectral channels found in image",
+                "LoadSpectralFromMemory", 0));
+  }
+
+  // Sort wavelengths
+  std::sort(wavelengths_set.begin(), wavelengths_set.end());
+  spectral.wavelengths = wavelengths_set;
+
+  size_t num_wavelengths = wavelengths_set.size();
+  size_t num_pixels = static_cast<size_t>(img.width) * img.height;
+
+  // Determine spectrum type
+  bool is_polarised = has_stokes[0] && has_stokes[1] && has_stokes[2] && has_stokes[3];
+  if (is_polarised) {
+    spectral.spectrum_type = SPECTRUM_EMISSIVE | SPECTRUM_POLARISED;
+    spectral.stokes_data.resize(4);
+    for (int s = 0; s < 4; s++) {
+      spectral.stokes_data[s].resize(num_wavelengths);
+      for (size_t w = 0; w < num_wavelengths; w++) {
+        spectral.stokes_data[s][w].resize(num_pixels, 0.0f);
+      }
+    }
+  } else if (is_reflective) {
+    spectral.spectrum_type = SPECTRUM_REFLECTIVE;
+    spectral.spectral_data.resize(num_wavelengths);
+    for (size_t w = 0; w < num_wavelengths; w++) {
+      spectral.spectral_data[w].resize(num_pixels, 0.0f);
+    }
+  } else {
+    spectral.spectrum_type = SPECTRUM_EMISSIVE;
+    spectral.spectral_data.resize(num_wavelengths);
+    for (size_t w = 0; w < num_wavelengths; w++) {
+      spectral.spectral_data[w].resize(num_pixels, 0.0f);
+    }
+  }
+
+  // Extract channel data
+  for (size_t c = 0; c < img.header.channels.size(); c++) {
+    const std::string& ch_name = img.header.channels[c].name;
+
+    // Check for RGB preview
+    if (ch_name == "R" || ch_name == "G" || ch_name == "B") {
+      if (spectral.rgb_preview.empty()) {
+        spectral.rgb_preview.resize(num_pixels * 3, 0.0f);
+      }
+      int rgb_idx = (ch_name == "R") ? 0 : (ch_name == "G") ? 1 : 2;
+
+      // Get raw channel data
+      if (c < img.raw_channels.size() && !img.raw_channels[c].empty()) {
+        int ch_size = (img.header.channels[c].pixel_type == PIXEL_TYPE_HALF) ? 2 : 4;
+        const uint8_t* src = img.raw_channels[c].data();
+        for (size_t i = 0; i < num_pixels; i++) {
+          float val;
+          if (ch_size == 2) {
+            uint16_t h;
+            std::memcpy(&h, src + i * 2, 2);
+            val = HalfToFloat(h);
+          } else {
+            std::memcpy(&val, src + i * 4, 4);
+          }
+          spectral.rgb_preview[i * 3 + rgb_idx] = val;
+        }
+      }
+      continue;
+    }
+
+    // Check for spectral channel
+    float wl = ParseSpectralChannelWavelength(ch_name);
+    if (wl <= 0.0f) continue;
+
+    int stokes = GetStokesComponent(ch_name);
+
+    // Find wavelength index
+    int wl_idx = -1;
+    for (size_t w = 0; w < num_wavelengths; w++) {
+      if (std::abs(spectral.wavelengths[w] - wl) < 0.001f) {
+        wl_idx = static_cast<int>(w);
+        break;
+      }
+    }
+    if (wl_idx < 0) continue;
+
+    // Get raw channel data
+    if (c < img.raw_channels.size() && !img.raw_channels[c].empty()) {
+      int ch_size = (img.header.channels[c].pixel_type == PIXEL_TYPE_HALF) ? 2 : 4;
+      const uint8_t* src = img.raw_channels[c].data();
+
+      std::vector<float>* dest = nullptr;
+      if (is_polarised && stokes >= 0 && stokes < 4) {
+        dest = &spectral.stokes_data[stokes][wl_idx];
+      } else if (!is_polarised) {
+        dest = &spectral.spectral_data[wl_idx];
+      }
+
+      if (dest) {
+        for (size_t i = 0; i < num_pixels; i++) {
+          float val;
+          if (ch_size == 2) {
+            uint16_t h;
+            std::memcpy(&h, src + i * 2, 2);
+            val = HalfToFloat(h);
+          } else {
+            std::memcpy(&val, src + i * 4, 4);
+          }
+          (*dest)[i] = val;
+        }
+      }
+    }
+  }
+
+  return Result<SpectralImageData>::ok(std::move(spectral));
+}
+
+Result<SpectralImageData> LoadSpectralFromFile(const char* filename) {
+  if (!filename) {
+    return Result<SpectralImageData>::error(
+      ErrorInfo(ErrorCode::InvalidArgument, "Null filename",
+                "LoadSpectralFromFile", 0));
+  }
+
+  FILE* fp = fopen(filename, "rb");
+  if (!fp) {
+    return Result<SpectralImageData>::error(
+      ErrorInfo(ErrorCode::IOError, "Failed to open file for reading",
+                filename, 0));
+  }
+
+  fseek(fp, 0, SEEK_END);
+  long file_size = ftell(fp);
+  fseek(fp, 0, SEEK_SET);
+
+  if (file_size <= 0) {
+    fclose(fp);
+    return Result<SpectralImageData>::error(
+      ErrorInfo(ErrorCode::IOError, "File is empty or seek failed",
+                filename, 0));
+  }
+
+  std::vector<uint8_t> data(static_cast<size_t>(file_size));
+  size_t read_size = fread(data.data(), 1, data.size(), fp);
+  fclose(fp);
+
+  if (read_size != data.size()) {
+    return Result<SpectralImageData>::error(
+      ErrorInfo(ErrorCode::IOError, "Failed to read complete file",
+                filename, 0));
+  }
+
+  return LoadSpectralFromMemory(data.data(), data.size());
+}
+
 }  // namespace v2
 }  // namespace tinyexr
 

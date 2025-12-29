@@ -2283,6 +2283,115 @@ TEST_CASE("v2: Deep tiled write and read", "[v2][deep][tiled]") {
   REQUIRE((version_bits & 0x800) != 0);  // non_image flag (deep)
 }
 
+TEST_CASE("v2: Spectral EXR save and load", "[v2][spectral]") {
+  using namespace tinyexr::v2;
+
+  const int width = 8;
+  const int height = 8;
+
+  // Create spectral image with 7 wavelengths (visible spectrum)
+  SpectralImageData spectral;
+  spectral.width = width;
+  spectral.height = height;
+
+  std::vector<float> wavelengths = {400.0f, 450.0f, 500.0f, 550.0f, 600.0f, 650.0f, 700.0f};
+  spectral.SetupEmissive(wavelengths);
+
+  // Fill with test data
+  for (size_t w = 0; w < wavelengths.size(); w++) {
+    for (int y = 0; y < height; y++) {
+      for (int x = 0; x < width; x++) {
+        // Create a gradient pattern
+        float val = static_cast<float>(w) / wavelengths.size() +
+                    static_cast<float>(x) / width * 0.1f +
+                    static_cast<float>(y) / height * 0.1f;
+        spectral.SetPixel(static_cast<int>(w), x, y, val);
+      }
+    }
+  }
+
+  // Set EV
+  spectral.SetEV(1.5f);
+
+  // Save
+  auto save_result = SaveSpectralToMemory(spectral, 6);
+  REQUIRE(save_result.success);
+  INFO("Spectral: Saved " << save_result.value.size() << " bytes with " << wavelengths.size() << " wavelengths");
+
+  // Load back
+  auto load_result = LoadSpectralFromMemory(save_result.value.data(), save_result.value.size());
+  REQUIRE(load_result.success);
+
+  const auto& loaded = load_result.value;
+
+  // Verify dimensions
+  REQUIRE(loaded.width == width);
+  REQUIRE(loaded.height == height);
+  REQUIRE(loaded.wavelengths.size() == wavelengths.size());
+
+  // Verify wavelengths
+  for (size_t w = 0; w < wavelengths.size(); w++) {
+    REQUIRE(std::abs(loaded.wavelengths[w] - wavelengths[w]) < 0.01f);
+  }
+
+  // Verify spectral data
+  int errors = 0;
+  for (size_t w = 0; w < wavelengths.size(); w++) {
+    for (int y = 0; y < height; y++) {
+      for (int x = 0; x < width; x++) {
+        float expected = spectral.GetPixel(static_cast<int>(w), x, y);
+        float actual = loaded.GetPixel(static_cast<int>(w), x, y);
+        if (std::abs(expected - actual) > 0.001f) {
+          errors++;
+        }
+      }
+    }
+  }
+  INFO("Spectral pixel errors: " << errors);
+  REQUIRE(errors == 0);
+
+  // Verify EV attribute preserved
+  REQUIRE(loaded.header.has_attribute("EV"));
+  REQUIRE(std::abs(loaded.header.get_float_attribute("EV") - 1.5f) < 0.001f);
+
+  // Verify spectralLayoutVersion attribute
+  REQUIRE(loaded.header.has_attribute("spectralLayoutVersion"));
+  REQUIRE(loaded.header.get_string_attribute("spectralLayoutVersion") == "1.0");
+}
+
+TEST_CASE("v2: Spectral channel naming", "[v2][spectral]") {
+  using namespace tinyexr::v2;
+
+  // Test channel name generation
+  std::string ch_name = SpectralChannelName(550.5f, 0);
+  REQUIRE(ch_name.find("S0.") == 0);
+  REQUIRE(ch_name.find("nm") != std::string::npos);
+
+  std::string refl_name = ReflectiveChannelName(600.0f);
+  REQUIRE(refl_name.find("T.") == 0);
+
+  // Test wavelength parsing
+  float wl1 = ParseSpectralChannelWavelength("S0.550,000000nm");
+  REQUIRE(std::abs(wl1 - 550.0f) < 0.01f);
+
+  float wl2 = ParseSpectralChannelWavelength("T.600,500000nm");
+  REQUIRE(std::abs(wl2 - 600.5f) < 0.01f);
+
+  // Test Stokes component detection
+  REQUIRE(GetStokesComponent("S0.550,000000nm") == 0);
+  REQUIRE(GetStokesComponent("S1.550,000000nm") == 1);
+  REQUIRE(GetStokesComponent("S2.550,000000nm") == 2);
+  REQUIRE(GetStokesComponent("S3.550,000000nm") == 3);
+  REQUIRE(GetStokesComponent("T.550,000000nm") == -1);  // Reflective
+  REQUIRE(GetStokesComponent("R") == -2);  // Not spectral
+
+  // Test IsSpectralChannel
+  REQUIRE(IsSpectralChannel("S0.550,000000nm") == true);
+  REQUIRE(IsSpectralChannel("T.600,000000nm") == true);
+  REQUIRE(IsSpectralChannel("R") == false);
+  REQUIRE(IsSpectralChannel("G") == false);
+}
+
 TEST_CASE("v2: Spectral EXR attributes", "[v2][attributes][spectral]") {
   using namespace tinyexr::v2;
 

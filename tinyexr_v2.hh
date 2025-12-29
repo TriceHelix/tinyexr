@@ -885,6 +885,178 @@ struct Header {
 };
 
 // ============================================================================
+// Spectral EXR Support (per JCGT paper: "An OpenEXR Layout for Spectral Images")
+// ============================================================================
+
+// Spectrum type flags (can be combined)
+constexpr int SPECTRUM_REFLECTIVE = 2;      // Transmittance/reflectance (0-1 range)
+constexpr int SPECTRUM_EMISSIVE = 4;        // Radiance values
+constexpr int SPECTRUM_BISPECTRAL = 8 | 2;  // Fluorescent materials
+constexpr int SPECTRUM_POLARISED = 16;      // Full Stokes polarization (S0-S3)
+
+// Spectral channel naming utilities
+// Format: S{stokes}.{wavelength}nm or T.{wavelength}nm
+// Note: wavelengths use comma as decimal separator (European convention)
+
+// Format wavelength for channel name (e.g., 550.5 -> "550,500000")
+inline std::string FormatWavelength(float wavelength_nm) {
+  char buf[32];
+  // Use 6 decimal places, comma as separator
+  int whole = static_cast<int>(wavelength_nm);
+  int frac = static_cast<int>((wavelength_nm - whole) * 1000000 + 0.5f);
+  snprintf(buf, sizeof(buf), "%d,%06d", whole, frac);
+  return std::string(buf);
+}
+
+// Create emissive spectral channel name (S0 for unpolarized, S0-S3 for polarized)
+inline std::string SpectralChannelName(float wavelength_nm, int stokes_component = 0) {
+  return "S" + std::to_string(stokes_component) + "." + FormatWavelength(wavelength_nm) + "nm";
+}
+
+// Create reflective/transmittance spectral channel name
+inline std::string ReflectiveChannelName(float wavelength_nm) {
+  return "T." + FormatWavelength(wavelength_nm) + "nm";
+}
+
+// Parse wavelength from channel name (returns 0 if not a spectral channel)
+inline float ParseSpectralChannelWavelength(const std::string& name) {
+  // Match S0.xxx,yyyyyy[unit] or T.xxx,yyyyyy[unit]
+  size_t dot_pos = name.find('.');
+  if (dot_pos == std::string::npos || dot_pos < 1) return 0.0f;
+
+  // Check prefix
+  char prefix = name[0];
+  if (prefix != 'S' && prefix != 'T') return 0.0f;
+
+  // Extract wavelength part (after dot, before unit)
+  std::string wl_str;
+  for (size_t i = dot_pos + 1; i < name.size(); i++) {
+    char c = name[i];
+    if ((c >= '0' && c <= '9') || c == ',' || c == '.') {
+      wl_str += (c == ',') ? '.' : c;  // Convert comma to dot
+    } else {
+      break;  // Hit unit suffix
+    }
+  }
+
+  if (wl_str.empty()) return 0.0f;
+  return static_cast<float>(std::atof(wl_str.c_str()));
+}
+
+// Check if a channel is a spectral channel
+inline bool IsSpectralChannel(const std::string& name) {
+  return ParseSpectralChannelWavelength(name) > 0.0f;
+}
+
+// Get Stokes component from channel name (0-3, or -1 for reflective/non-spectral)
+inline int GetStokesComponent(const std::string& name) {
+  if (name.size() >= 2 && name[0] == 'S' && name[1] >= '0' && name[1] <= '3') {
+    return name[1] - '0';
+  }
+  if (name.size() >= 2 && name[0] == 'T' && name[1] == '.') {
+    return -1;  // Reflective channel
+  }
+  return -2;  // Not a spectral channel
+}
+
+// Spectral image data
+struct SpectralImageData {
+  int width;
+  int height;
+  Header header;
+
+  // Wavelengths in nm (sorted ascending)
+  std::vector<float> wavelengths;
+
+  // Spectral data: spectral_data[wavelength_index][pixel_index]
+  // For polarized images, use stokes_data instead
+  std::vector<std::vector<float>> spectral_data;
+
+  // For polarized images: stokes_data[stokes_component][wavelength_index][pixel_index]
+  // stokes_component: 0=S0 (intensity), 1=S1, 2=S2, 3=S3
+  std::vector<std::vector<std::vector<float>>> stokes_data;
+
+  // RGB preview (optional, for compatibility with non-spectral viewers)
+  std::vector<float> rgb_preview;  // RGB interleaved, size = width * height * 3
+
+  // Spectrum type
+  int spectrum_type;
+
+  SpectralImageData() : width(0), height(0), spectrum_type(SPECTRUM_EMISSIVE) {}
+
+  // Set up as emissive spectral image
+  void SetupEmissive(const std::vector<float>& wavelengths_nm) {
+    spectrum_type = SPECTRUM_EMISSIVE;
+    wavelengths = wavelengths_nm;
+    std::sort(wavelengths.begin(), wavelengths.end());
+    spectral_data.resize(wavelengths.size());
+    for (auto& ch : spectral_data) {
+      ch.resize(static_cast<size_t>(width) * height, 0.0f);
+    }
+    header.set_string_attribute("spectralLayoutVersion", "1.0");
+    header.set_string_attribute("emissiveUnits", "W.m^-2.sr^-1");
+  }
+
+  // Set up as reflective spectral image
+  void SetupReflective(const std::vector<float>& wavelengths_nm) {
+    spectrum_type = SPECTRUM_REFLECTIVE;
+    wavelengths = wavelengths_nm;
+    std::sort(wavelengths.begin(), wavelengths.end());
+    spectral_data.resize(wavelengths.size());
+    for (auto& ch : spectral_data) {
+      ch.resize(static_cast<size_t>(width) * height, 0.0f);
+    }
+    header.set_string_attribute("spectralLayoutVersion", "1.0");
+  }
+
+  // Set up as polarized emissive spectral image (4 Stokes components)
+  void SetupPolarised(const std::vector<float>& wavelengths_nm, bool left_handed = true) {
+    spectrum_type = SPECTRUM_EMISSIVE | SPECTRUM_POLARISED;
+    wavelengths = wavelengths_nm;
+    std::sort(wavelengths.begin(), wavelengths.end());
+    stokes_data.resize(4);  // S0, S1, S2, S3
+    for (auto& stokes : stokes_data) {
+      stokes.resize(wavelengths.size());
+      for (auto& ch : stokes) {
+        ch.resize(static_cast<size_t>(width) * height, 0.0f);
+      }
+    }
+    header.set_string_attribute("spectralLayoutVersion", "1.0");
+    header.set_string_attribute("emissiveUnits", "W.m^-2.sr^-1");
+    header.set_string_attribute("polarisationHandedness", left_handed ? "left" : "right");
+  }
+
+  // Set exposure value (EV) for the image
+  void SetEV(float ev) {
+    header.set_float_attribute("EV", ev);
+  }
+
+  // Set lens transmission spectrum (format: "400nm:0.95;500nm:0.97;...")
+  void SetLensTransmission(const std::string& spectrum) {
+    header.set_string_attribute("lensTransmission", spectrum);
+  }
+
+  // Set camera response spectrum
+  void SetCameraResponse(const std::string& spectrum) {
+    header.set_string_attribute("cameraResponse", spectrum);
+  }
+
+  // Get pixel value for a specific wavelength and position
+  float GetPixel(int wavelength_idx, int x, int y) const {
+    if (wavelength_idx < 0 || wavelength_idx >= static_cast<int>(wavelengths.size())) return 0.0f;
+    if (x < 0 || x >= width || y < 0 || y >= height) return 0.0f;
+    return spectral_data[wavelength_idx][y * width + x];
+  }
+
+  // Set pixel value for a specific wavelength and position
+  void SetPixel(int wavelength_idx, int x, int y, float value) {
+    if (wavelength_idx < 0 || wavelength_idx >= static_cast<int>(wavelengths.size())) return;
+    if (x < 0 || x >= width || y < 0 || y >= height) return;
+    spectral_data[wavelength_idx][y * width + x] = value;
+  }
+};
+
+// ============================================================================
 // Parser functions
 // ============================================================================
 
@@ -1027,6 +1199,30 @@ Result<std::vector<uint8_t>> SaveMultipartToMemory(const MultipartImageData& mul
 
 // Save multipart image data to file
 Result<void> SaveMultipartToFile(const char* filename, const MultipartImageData& multipart, int compression_level = 6);
+
+// ============================================================================
+// Spectral Image I/O
+// ============================================================================
+
+// Save spectral image to memory
+// Uses FLOAT pixel type for spectral channels to preserve accuracy
+// Optionally includes RGB preview channels for compatibility
+// compression_level: 1-9 for ZIP compression (6 = default)
+Result<std::vector<uint8_t>> SaveSpectralToMemory(const SpectralImageData& spectral, int compression_level);
+Result<std::vector<uint8_t>> SaveSpectralToMemory(const SpectralImageData& spectral);
+
+// Save spectral image to file
+Result<void> SaveSpectralToFile(const char* filename, const SpectralImageData& spectral, int compression_level = 6);
+
+// Load spectral image from memory
+// Detects spectral channels by naming convention (S0.xxxnm, T.xxxnm)
+Result<SpectralImageData> LoadSpectralFromMemory(const uint8_t* data, size_t size);
+
+// Load spectral image from file
+Result<SpectralImageData> LoadSpectralFromFile(const char* filename);
+
+// Check if an EXR file contains spectral data (by checking header attributes)
+bool IsSpectralEXR(const Header& header);
 
 // ============================================================================
 // Pixel Processing Utilities (with SIMD optimization when enabled)
