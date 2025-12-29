@@ -1580,10 +1580,17 @@ Result<Header> ParseHeader(Reader& reader, const Version& version) {
       header.deep_data_version = static_cast<int>(ver);
     }
     else {
-      // Unknown attribute - skip it
-      if (!reader.seek_relative(data_size)) {
-        return Result<Header>::error(reader.last_error());
+      // Unknown attribute - store it in custom_attributes
+      Attribute custom_attr;
+      custom_attr.name = attr_name;
+      custom_attr.type = attr_type;
+      custom_attr.data.resize(data_size);
+      if (data_size > 0) {
+        if (!reader.read(data_size, custom_attr.data.data())) {
+          return Result<Header>::error(reader.last_error());
+        }
       }
+      header.custom_attributes.push_back(custom_attr);
     }
   }
 
@@ -2899,6 +2906,36 @@ Result<void> WriteHeader(Writer& writer, const Header& header) {
     }
     if (!writer.write4(static_cast<uint32_t>(header.chunk_count))) {
       return Result<void>::error(writer.last_error());
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Write custom attributes
+  // -------------------------------------------------------------------------
+  for (const auto& attr : header.custom_attributes) {
+    // Skip empty names
+    if (attr.name.empty()) continue;
+
+    // Write attribute name (null-terminated)
+    if (!writer.write_string(attr.name.c_str())) {
+      return Result<void>::error(writer.last_error());
+    }
+
+    // Write attribute type (null-terminated)
+    if (!writer.write_string(attr.type.c_str())) {
+      return Result<void>::error(writer.last_error());
+    }
+
+    // Write attribute data size
+    if (!writer.write4(static_cast<uint32_t>(attr.data.size()))) {
+      return Result<void>::error(writer.last_error());
+    }
+
+    // Write attribute data
+    if (!attr.data.empty()) {
+      if (!writer.write(attr.data.size(), attr.data.data())) {
+        return Result<void>::error(writer.last_error());
+      }
     }
   }
 

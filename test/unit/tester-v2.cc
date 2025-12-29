@@ -2128,3 +2128,140 @@ TEST_CASE("v2: PIZ compression all zeros (issue 194)", "[v2][piz][compression]")
     REQUIRE(loaded.rgba[i] == 0.0f);
   }
 }
+
+// ============================================================================
+// Custom Attributes Tests
+// ============================================================================
+
+TEST_CASE("v2: Custom attributes round-trip", "[v2][attributes]") {
+  using namespace tinyexr::v2;
+
+  const int width = 8;
+  const int height = 8;
+
+  // Create test image
+  ImageData original;
+  original.width = width;
+  original.height = height;
+  original.num_channels = 4;
+  original.rgba.resize(width * height * 4, 1.0f);
+
+  original.header.compression = COMPRESSION_ZIP;
+  original.header.data_window.min_x = 0;
+  original.header.data_window.min_y = 0;
+  original.header.data_window.max_x = width - 1;
+  original.header.data_window.max_y = height - 1;
+  original.header.display_window = original.header.data_window;
+  original.header.pixel_aspect_ratio = 1.0f;
+  original.header.screen_window_width = 1.0f;
+  original.header.line_order = 0;
+
+  Channel ch_r, ch_g, ch_b, ch_a;
+  ch_r.name = "R"; ch_r.pixel_type = PIXEL_TYPE_HALF;
+  ch_g.name = "G"; ch_g.pixel_type = PIXEL_TYPE_HALF;
+  ch_b.name = "B"; ch_b.pixel_type = PIXEL_TYPE_HALF;
+  ch_a.name = "A"; ch_a.pixel_type = PIXEL_TYPE_HALF;
+  original.header.channels.push_back(ch_a);
+  original.header.channels.push_back(ch_b);
+  original.header.channels.push_back(ch_g);
+  original.header.channels.push_back(ch_r);
+
+  // Add custom attributes
+  original.header.set_string_attribute("myString", "Hello, EXR!");
+  original.header.set_int_attribute("myInt", 42);
+  original.header.set_float_attribute("myFloat", 3.14159f);
+  original.header.set_attribute(Attribute::V2f("myV2f", 1.5f, 2.5f));
+
+  // Save
+  auto save_result = SaveToMemory(original, 6);
+  REQUIRE(save_result.success);
+
+  // Load back
+  auto load_result = LoadFromMemory(save_result.value.data(), save_result.value.size());
+  REQUIRE(load_result.success);
+
+  const auto& loaded = load_result.value;
+
+  // Check custom attributes were preserved
+  REQUIRE(loaded.header.has_attribute("myString"));
+  REQUIRE(loaded.header.has_attribute("myInt"));
+  REQUIRE(loaded.header.has_attribute("myFloat"));
+  REQUIRE(loaded.header.has_attribute("myV2f"));
+
+  REQUIRE(loaded.header.get_string_attribute("myString") == "Hello, EXR!");
+  REQUIRE(loaded.header.get_int_attribute("myInt") == 42);
+  REQUIRE(std::abs(loaded.header.get_float_attribute("myFloat") - 3.14159f) < 0.0001f);
+
+  // Check V2f attribute
+  const Attribute* v2f = loaded.header.find_attribute("myV2f");
+  REQUIRE(v2f != nullptr);
+  REQUIRE(v2f->type == "v2f");
+  REQUIRE(v2f->data.size() == 8);
+  float x, y;
+  std::memcpy(&x, v2f->data.data(), 4);
+  std::memcpy(&y, v2f->data.data() + 4, 4);
+  REQUIRE(std::abs(x - 1.5f) < 0.0001f);
+  REQUIRE(std::abs(y - 2.5f) < 0.0001f);
+}
+
+TEST_CASE("v2: Spectral EXR attributes", "[v2][attributes][spectral]") {
+  using namespace tinyexr::v2;
+
+  const int width = 4;
+  const int height = 4;
+
+  // Create test image simulating spectral EXR
+  ImageData original;
+  original.width = width;
+  original.height = height;
+  original.num_channels = 4;
+  original.rgba.resize(width * height * 4, 0.5f);
+
+  original.header.compression = COMPRESSION_ZIP;
+  original.header.data_window.min_x = 0;
+  original.header.data_window.min_y = 0;
+  original.header.data_window.max_x = width - 1;
+  original.header.data_window.max_y = height - 1;
+  original.header.display_window = original.header.data_window;
+  original.header.pixel_aspect_ratio = 1.0f;
+  original.header.screen_window_width = 1.0f;
+  original.header.line_order = 0;
+
+  Channel ch_r, ch_g, ch_b, ch_a;
+  ch_r.name = "R"; ch_r.pixel_type = PIXEL_TYPE_HALF;
+  ch_g.name = "G"; ch_g.pixel_type = PIXEL_TYPE_HALF;
+  ch_b.name = "B"; ch_b.pixel_type = PIXEL_TYPE_HALF;
+  ch_a.name = "A"; ch_a.pixel_type = PIXEL_TYPE_HALF;
+  original.header.channels.push_back(ch_a);
+  original.header.channels.push_back(ch_b);
+  original.header.channels.push_back(ch_g);
+  original.header.channels.push_back(ch_r);
+
+  // Add spectral EXR custom attributes (per JCGT paper)
+  original.header.set_string_attribute("spectralLayoutVersion", "1.0");
+  original.header.set_string_attribute("emissiveUnits", "W.m^-2.sr^-1");
+  original.header.set_float_attribute("EV", 0.0f);
+
+  // Spectrum attribute format: "wavelength_nm:value;wavelength_nm:value;..."
+  original.header.set_string_attribute("lensTransmission",
+    "400nm:0.92;450nm:0.95;500nm:0.96;550nm:0.97;600nm:0.96;650nm:0.95;700nm:0.93;");
+
+  // Save
+  auto save_result = SaveToMemory(original, 6);
+  REQUIRE(save_result.success);
+
+  // Load back
+  auto load_result = LoadFromMemory(save_result.value.data(), save_result.value.size());
+  REQUIRE(load_result.success);
+
+  const auto& loaded = load_result.value;
+
+  // Check spectral attributes were preserved
+  REQUIRE(loaded.header.get_string_attribute("spectralLayoutVersion") == "1.0");
+  REQUIRE(loaded.header.get_string_attribute("emissiveUnits") == "W.m^-2.sr^-1");
+  REQUIRE(loaded.header.get_float_attribute("EV") == 0.0f);
+
+  std::string lens = loaded.header.get_string_attribute("lensTransmission");
+  REQUIRE(lens.find("400nm:0.92") != std::string::npos);
+  REQUIRE(lens.find("700nm:0.93") != std::string::npos);
+}

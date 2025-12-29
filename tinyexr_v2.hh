@@ -684,6 +684,113 @@ struct Box2i {
   int height() const { return max_y - min_y + 1; }
 };
 
+// Generic EXR attribute for custom/extended attributes
+struct Attribute {
+  std::string name;          // Attribute name
+  std::string type;          // Type string (e.g., "string", "float", "int", "v2f", etc.)
+  std::vector<uint8_t> data; // Raw attribute data
+
+  Attribute() = default;
+
+  Attribute(const std::string& n, const std::string& t, const std::vector<uint8_t>& d)
+    : name(n), type(t), data(d) {}
+
+  // Convenience constructors for common types
+  static Attribute String(const std::string& name, const std::string& value) {
+    Attribute attr;
+    attr.name = name;
+    attr.type = "string";
+    attr.data.assign(value.begin(), value.end());
+    return attr;
+  }
+
+  static Attribute Int(const std::string& name, int32_t value) {
+    Attribute attr;
+    attr.name = name;
+    attr.type = "int";
+    attr.data.resize(4);
+    std::memcpy(attr.data.data(), &value, 4);
+    return attr;
+  }
+
+  static Attribute Float(const std::string& name, float value) {
+    Attribute attr;
+    attr.name = name;
+    attr.type = "float";
+    attr.data.resize(4);
+    std::memcpy(attr.data.data(), &value, 4);
+    return attr;
+  }
+
+  static Attribute Double(const std::string& name, double value) {
+    Attribute attr;
+    attr.name = name;
+    attr.type = "double";
+    attr.data.resize(8);
+    std::memcpy(attr.data.data(), &value, 8);
+    return attr;
+  }
+
+  static Attribute V2f(const std::string& name, float x, float y) {
+    Attribute attr;
+    attr.name = name;
+    attr.type = "v2f";
+    attr.data.resize(8);
+    std::memcpy(attr.data.data(), &x, 4);
+    std::memcpy(attr.data.data() + 4, &y, 4);
+    return attr;
+  }
+
+  static Attribute V3f(const std::string& name, float x, float y, float z) {
+    Attribute attr;
+    attr.name = name;
+    attr.type = "v3f";
+    attr.data.resize(12);
+    std::memcpy(attr.data.data(), &x, 4);
+    std::memcpy(attr.data.data() + 4, &y, 4);
+    std::memcpy(attr.data.data() + 8, &z, 4);
+    return attr;
+  }
+
+  // Get value as string (for "string" type)
+  std::string as_string() const {
+    if (type == "string") {
+      return std::string(data.begin(), data.end());
+    }
+    return "";
+  }
+
+  // Get value as int (for "int" type)
+  int32_t as_int() const {
+    if (type == "int" && data.size() >= 4) {
+      int32_t v;
+      std::memcpy(&v, data.data(), 4);
+      return v;
+    }
+    return 0;
+  }
+
+  // Get value as float (for "float" type)
+  float as_float() const {
+    if (type == "float" && data.size() >= 4) {
+      float v;
+      std::memcpy(&v, data.data(), 4);
+      return v;
+    }
+    return 0.0f;
+  }
+
+  // Get value as double (for "double" type)
+  double as_double() const {
+    if (type == "double" && data.size() >= 8) {
+      double v;
+      std::memcpy(&v, data.data(), 8);
+      return v;
+    }
+    return 0.0;
+  }
+};
+
 struct Header {
   std::vector<Channel> channels;
   Box2i data_window;
@@ -709,6 +816,9 @@ struct Header {
   int deep_data_version;      // Version of deep data format (1 = current)
   bool is_deep;               // True if this is a deep image part
 
+  // Custom/extended attributes (non-standard attributes)
+  std::vector<Attribute> custom_attributes;
+
   size_t header_len;  // Length of header in bytes
 
   Header()
@@ -718,6 +828,59 @@ struct Header {
       deep_data_version(0), is_deep(false), header_len(0) {
     screen_window_center[0] = 0.0f;
     screen_window_center[1] = 0.0f;
+  }
+
+  // Find custom attribute by name (returns nullptr if not found)
+  const Attribute* find_attribute(const std::string& name) const {
+    for (const auto& attr : custom_attributes) {
+      if (attr.name == name) return &attr;
+    }
+    return nullptr;
+  }
+
+  // Check if custom attribute exists
+  bool has_attribute(const std::string& name) const {
+    return find_attribute(name) != nullptr;
+  }
+
+  // Set or add custom attribute (replaces if exists)
+  void set_attribute(const Attribute& attr) {
+    for (auto& existing : custom_attributes) {
+      if (existing.name == attr.name) {
+        existing = attr;
+        return;
+      }
+    }
+    custom_attributes.push_back(attr);
+  }
+
+  // Convenience setters for common types
+  void set_string_attribute(const std::string& name, const std::string& value) {
+    set_attribute(Attribute::String(name, value));
+  }
+
+  void set_int_attribute(const std::string& name, int32_t value) {
+    set_attribute(Attribute::Int(name, value));
+  }
+
+  void set_float_attribute(const std::string& name, float value) {
+    set_attribute(Attribute::Float(name, value));
+  }
+
+  // Convenience getters for common types (returns default if not found)
+  std::string get_string_attribute(const std::string& name, const std::string& default_val = "") const {
+    const Attribute* attr = find_attribute(name);
+    return attr ? attr->as_string() : default_val;
+  }
+
+  int32_t get_int_attribute(const std::string& name, int32_t default_val = 0) const {
+    const Attribute* attr = find_attribute(name);
+    return attr ? attr->as_int() : default_val;
+  }
+
+  float get_float_attribute(const std::string& name, float default_val = 0.0f) const {
+    const Attribute* attr = find_attribute(name);
+    return attr ? attr->as_float() : default_val;
   }
 };
 
