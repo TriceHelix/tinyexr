@@ -1288,12 +1288,14 @@ private:
 
     // Optimized pattern copy for small distances
     if (distance == 2 && length >= 4) {
-      // Repeat 2-byte pattern
+      // Repeat 2-byte pattern - use memcpy for potentially unaligned access
       uint16_t pattern;
       std::memcpy(&pattern, src, 2);
       while (length >= 8) {
-        uint16_t* d16 = reinterpret_cast<uint16_t*>(dst);
-        d16[0] = pattern; d16[1] = pattern; d16[2] = pattern; d16[3] = pattern;
+        std::memcpy(dst + 0, &pattern, 2);
+        std::memcpy(dst + 2, &pattern, 2);
+        std::memcpy(dst + 4, &pattern, 2);
+        std::memcpy(dst + 6, &pattern, 2);
         dst += 8;
         length -= 8;
       }
@@ -1304,12 +1306,14 @@ private:
       }
       src = dst - distance;  // Update src for remainder
     } else if (distance == 4 && length >= 8) {
-      // Repeat 4-byte pattern
+      // Repeat 4-byte pattern - use memcpy for potentially unaligned access
       uint32_t pattern;
       std::memcpy(&pattern, src, 4);
       while (length >= 16) {
-        uint32_t* d32 = reinterpret_cast<uint32_t*>(dst);
-        d32[0] = pattern; d32[1] = pattern; d32[2] = pattern; d32[3] = pattern;
+        std::memcpy(dst + 0, &pattern, 4);
+        std::memcpy(dst + 4, &pattern, 4);
+        std::memcpy(dst + 8, &pattern, 4);
+        std::memcpy(dst + 12, &pattern, 4);
         dst += 16;
         length -= 16;
       }
