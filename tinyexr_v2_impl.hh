@@ -762,61 +762,115 @@ static bool DecompressB44V2(uint8_t* dst, size_t expected_size,
   return true;
 }
 
-// Pack 16 half values into a 14-byte B44 block using log-space encoding
-static void PackB44Block(uint8_t dst[14], const uint16_t src[16]) {
-  // B44 format:
-  // - 2 bytes: base value in log-space (big-endian, 14-bit)
-  // - 12 bytes: 15 6-bit deltas (90 bits packed) in log-space
-
-  InitB44Tables();
-
-  // Convert first value to log space and use as base
-  uint16_t base_log = HalfToLog(src[0]);
-  dst[0] = static_cast<uint8_t>(base_log >> 8);
-  dst[1] = static_cast<uint8_t>(base_log & 0xFF);
-
-  // Initialize delta bytes to zero
-  for (int i = 2; i < 14; i++) {
-    dst[i] = 0;
-  }
-
-  // Pack 15 6-bit deltas in log space
-  uint8_t* delta_ptr = dst + 2;
-  int bit_pos = 0;
-
-  for (int i = 1; i < 16; i++) {
-    // Calculate delta in log space (clamped to 6-bit range: -31 to +32)
-    uint16_t val_log = HalfToLog(src[i]);
-    int delta = static_cast<int>(val_log) - static_cast<int>(base_log);
-
-    // Clamp to representable range
-    if (delta < -31) delta = -31;
-    if (delta > 32) delta = 32;
-
-    // Convert signed delta to unsigned 6-bit value (bias by 31)
-    uint32_t bits = static_cast<uint32_t>(delta + 31) & 0x3F;
-
-    // Write 6 bits at current bit position
-    int byte_idx = bit_pos / 8;
-    int bit_offset = bit_pos % 8;
-
-    delta_ptr[byte_idx] |= static_cast<uint8_t>(bits << bit_offset);
-    if (bit_offset > 2 && byte_idx + 1 < 12) {
-      // Bits overflow into next byte
-      delta_ptr[byte_idx + 1] |= static_cast<uint8_t>(bits >> (8 - bit_offset));
-    }
-
-    bit_pos += 6;
-  }
+// Shift and round for B44 pack (matches OpenEXR's shiftAndRound)
+static inline int B44ShiftAndRound(int x, int shift) {
+  // Compute y = x * pow(2, -shift), rounded to nearest integer
+  // In case of a tie, round to the even one
+  x <<= 1;
+  int a = (1 << shift) - 1;
+  shift += 1;
+  int b = (x >> shift) & 1;
+  return (x + a + b) >> shift;
 }
 
-// Check if a 4x4 block has all identical values (for B44A optimization)
-static bool IsB44FlatBlock(const uint16_t src[16]) {
-  uint16_t val = src[0];
-  for (int i = 1; i < 16; i++) {
-    if (src[i] != val) return false;
+// Pack a 4x4 block of HALF values into 14 bytes (matches OpenEXR's pack())
+// Returns the number of bytes written (14 for normal, 3 for flat if flatfields=true)
+static int PackB44Block(uint8_t* out, const uint16_t* block, bool flatfields, bool exactmax) {
+  int d[16];
+  int r[15];
+  int rMin, rMax;
+  uint16_t t[16];
+  uint16_t tMax;
+  int shift = -1;
+
+  const int bias = 0x20;
+
+  // Convert half-float values to ordered-magnitude representation
+  // This ensures that if t[i] > t[j], then half[i] > half[j] as floats
+  for (int i = 0; i < 16; ++i) {
+    if ((block[i] & 0x7c00) == 0x7c00) {
+      t[i] = 0x8000;  // NaN/Inf -> neutral value
+    } else if (block[i] & 0x8000) {
+      t[i] = ~block[i];  // Negative: invert all bits
+    } else {
+      t[i] = block[i] | 0x8000;  // Positive: set sign bit
+    }
   }
-  return true;
+
+  // Find maximum t value
+  tMax = 0;
+  for (int i = 0; i < 16; ++i) {
+    if (tMax < t[i]) tMax = t[i];
+  }
+
+  // Compute running differences and find valid shift
+  do {
+    shift += 1;
+
+    // Compute absolute differences from tMax, shifted and rounded
+    for (int i = 0; i < 16; ++i) {
+      d[i] = B44ShiftAndRound(tMax - t[i], shift);
+    }
+
+    // Convert to running differences (specific pattern for B44)
+    r[0] = d[0] - d[4] + bias;
+    r[1] = d[4] - d[8] + bias;
+    r[2] = d[8] - d[12] + bias;
+
+    r[3] = d[0] - d[1] + bias;
+    r[4] = d[4] - d[5] + bias;
+    r[5] = d[8] - d[9] + bias;
+    r[6] = d[12] - d[13] + bias;
+
+    r[7]  = d[1] - d[2] + bias;
+    r[8]  = d[5] - d[6] + bias;
+    r[9]  = d[9] - d[10] + bias;
+    r[10] = d[13] - d[14] + bias;
+
+    r[11] = d[2] - d[3] + bias;
+    r[12] = d[6] - d[7] + bias;
+    r[13] = d[10] - d[11] + bias;
+    r[14] = d[14] - d[15] + bias;
+
+    rMin = r[0];
+    rMax = r[0];
+    for (int i = 1; i < 15; ++i) {
+      if (rMin > r[i]) rMin = r[i];
+      if (rMax < r[i]) rMax = r[i];
+    }
+  } while (rMin < 0 || rMax > 0x3f);
+
+  // Check for flat block (all pixels same value)
+  if (rMin == bias && rMax == bias && flatfields) {
+    // Encode as 3 bytes: t[0] and marker 0xfc
+    out[0] = static_cast<uint8_t>(t[0] >> 8);
+    out[1] = static_cast<uint8_t>(t[0]);
+    out[2] = 0xfc;  // Flat block marker (shift >= 13)
+    return 3;
+  }
+
+  if (exactmax) {
+    // Adjust t[0] so the max pixel is represented accurately
+    t[0] = tMax - static_cast<uint16_t>(d[0] << shift);
+  }
+
+  // Pack t[0], shift, and r[0]..r[14] into 14 bytes
+  out[0]  = static_cast<uint8_t>(t[0] >> 8);
+  out[1]  = static_cast<uint8_t>(t[0]);
+  out[2]  = static_cast<uint8_t>((shift << 2) | (r[0] >> 4));
+  out[3]  = static_cast<uint8_t>((r[0] << 4) | (r[1] >> 2));
+  out[4]  = static_cast<uint8_t>((r[1] << 6) | r[2]);
+  out[5]  = static_cast<uint8_t>((r[3] << 2) | (r[4] >> 4));
+  out[6]  = static_cast<uint8_t>((r[4] << 4) | (r[5] >> 2));
+  out[7]  = static_cast<uint8_t>((r[5] << 6) | r[6]);
+  out[8]  = static_cast<uint8_t>((r[7] << 2) | (r[8] >> 4));
+  out[9]  = static_cast<uint8_t>((r[8] << 4) | (r[9] >> 2));
+  out[10] = static_cast<uint8_t>((r[9] << 6) | r[10]);
+  out[11] = static_cast<uint8_t>((r[11] << 2) | (r[12] >> 4));
+  out[12] = static_cast<uint8_t>((r[12] << 4) | (r[13] >> 2));
+  out[13] = static_cast<uint8_t>((r[13] << 6) | r[14]);
+
+  return 14;
 }
 
 // Compress data using B44/B44A algorithm
@@ -912,18 +966,10 @@ static bool CompressB44V2(const uint8_t* src, size_t src_size,
           }
         }
 
-        // Check for flat block optimization (B44A only)
-        if (is_b44a && IsB44FlatBlock(block)) {
-          // Write 3-byte flat block: 0x80 flag + 2 bytes value
-          dst.push_back(0x80);
-          dst.push_back(static_cast<uint8_t>(block[0] >> 8));
-          dst.push_back(static_cast<uint8_t>(block[0] & 0xFF));
-        } else {
-          // Write 14-byte regular block
-          uint8_t packed[14];
-          PackB44Block(packed, block);
-          dst.insert(dst.end(), packed, packed + 14);
-        }
+        // Pack the block (14 bytes for normal, 3 bytes for flat if B44A)
+        uint8_t packed[14];
+        int packed_size = PackB44Block(packed, block, is_b44a, false);
+        dst.insert(dst.end(), packed, packed + packed_size);
       }
     }
   }
