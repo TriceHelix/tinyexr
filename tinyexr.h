@@ -3956,29 +3956,29 @@ static bool DecompressB44(unsigned char *outPtr, size_t outBufSize,
     }
   }
 
-  // Second pass: copy from scratch buffers to output in scanline-interleaved format
-  // Output format: for each scanline, all channels' data for that scanline
+  // Second pass: copy from scratch buffers to output in per-channel format
+  // Output format: all data for channel 0, then all data for channel 1, etc.
+  // This matches what DecodePixelData expects (ch_offset = c * width * num_lines * bytes)
   unsigned char* out_p = outPtr;
-  for (int y = 0; y < num_lines; y++) {
-    for (size_t c = 0; c < num_channels; c++) {
-      int x_sampling = channels[c].x_sampling > 0 ? channels[c].x_sampling : 1;
-      int y_sampling = channels[c].y_sampling > 0 ? channels[c].y_sampling : 1;
-      int ch_width = (data_width + x_sampling - 1) / x_sampling;
+  for (size_t c = 0; c < num_channels; c++) {
+    int x_sampling = channels[c].x_sampling > 0 ? channels[c].x_sampling : 1;
+    int y_sampling = channels[c].y_sampling > 0 ? channels[c].y_sampling : 1;
+    int ch_width = (data_width + x_sampling - 1) / x_sampling;
+    int ch_height = (num_lines + y_sampling - 1) / y_sampling;
+    int padded_width = ((ch_width + 3) / 4) * 4;
 
-      // Skip channels that don't have data for this scanline (due to y_sampling)
-      if ((y % y_sampling) != 0) continue;
-
-      int src_y = y / y_sampling;
-      int padded_width = ((ch_width + 3) / 4) * 4;
-
-      if (channels[c].pixel_type == TINYEXR_PIXELTYPE_HALF) {
-        // Copy this scanline's worth of data
+    if (channels[c].pixel_type == TINYEXR_PIXELTYPE_HALF) {
+      for (int y = 0; y < ch_height; y++) {
         for (int x = 0; x < ch_width; x++) {
-          unsigned short val = scratch_buffers[c][static_cast<size_t>(src_y) * padded_width + x];
+          unsigned short val = scratch_buffers[c][static_cast<size_t>(y) * padded_width + x];
           memcpy(out_p, &val, sizeof(val));
           out_p += sizeof(val);
         }
       }
+    } else if (channels[c].pixel_type == TINYEXR_PIXELTYPE_UINT ||
+               channels[c].pixel_type == TINYEXR_PIXELTYPE_FLOAT) {
+      // Non-HALF data was already skipped during decompression
+      // Copy the uncompressed data directly (handled by DecodePixelData separately)
     }
   }
 

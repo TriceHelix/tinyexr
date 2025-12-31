@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstring>
 #include <vector>
+#include <algorithm>
 
 // Include dependencies
 #include "tinyexr_v2.hh"
@@ -998,6 +999,15 @@ inline bool hufUncompress(const uint8_t* compressed, size_t nCompressed,
     return false;
   }
 
+  // Special case: nBits=0 means all values are the same (symbol im)
+  // This happens when im==iM (only one unique symbol in the data)
+  if (nBits == 0) {
+    for (size_t i = 0; i < nRaw; i++) {
+      raw[i] = static_cast<uint16_t>(im);
+    }
+    return true;
+  }
+
   // Build decode table
   std::vector<HufDec> hdec(HUF_DECSIZE);
   std::vector<int> long_codes;
@@ -1452,7 +1462,21 @@ inline bool hufBuildEncTable(int64_t* freq, int* im, int* iM) {
   return true;
 }
 
-// Output n bits to buffer
+// Output n bits to buffer with bounds checking
+// Returns false if buffer overflow would occur
+inline bool outputBitsSafe(int nBits, int64_t bits, int64_t& c, int& lc,
+                           uint8_t*& out, const uint8_t* outEnd) {
+  c = (c << nBits) | bits;
+  lc += nBits;
+  while (lc >= 8) {
+    if (out >= outEnd) return false;  // Buffer overflow
+    lc -= 8;
+    *out++ = static_cast<uint8_t>(c >> lc);
+  }
+  return true;
+}
+
+// Output n bits to buffer (legacy, no bounds checking)
 inline void outputBits(int nBits, int64_t bits, int64_t& c, int& lc, uint8_t*& out) {
   c = (c << nBits) | bits;
   lc += nBits;
@@ -1462,11 +1486,38 @@ inline void outputBits(int nBits, int64_t bits, int64_t& c, int& lc, uint8_t*& o
   }
 }
 
+// Output Huffman code with bounds checking
+inline bool outputCodeSafe(int64_t code, int64_t& c, int& lc,
+                           uint8_t*& out, const uint8_t* outEnd) {
+  int length = static_cast<int>(code & 63);
+  int64_t bits = code >> 6;
+  return outputBitsSafe(length, bits, c, lc, out, outEnd);
+}
+
 // Output Huffman code
 inline void outputCode(int64_t code, int64_t& c, int& lc, uint8_t*& out) {
   int length = static_cast<int>(code & 63);
   int64_t bits = code >> 6;
   outputBits(length, bits, c, lc, out);
+}
+
+// Send code with optional run-length encoding (with bounds checking)
+inline bool sendCodeSafe(int64_t sCode, int runCount, int64_t runCode,
+                         int64_t& c, int& lc, uint8_t*& out, const uint8_t* outEnd) {
+  int sLen = static_cast<int>(sCode & 63);
+  int rlcLen = static_cast<int>(runCode & 63);
+
+  // Check if RLC is more efficient
+  if (sLen + rlcLen + 8 < sLen * (runCount + 1)) {
+    if (!outputCodeSafe(sCode, c, lc, out, outEnd)) return false;
+    if (!outputCodeSafe(runCode, c, lc, out, outEnd)) return false;
+    if (!outputBitsSafe(8, runCount, c, lc, out, outEnd)) return false;
+  } else {
+    for (int i = 0; i <= runCount; i++) {
+      if (!outputCodeSafe(sCode, c, lc, out, outEnd)) return false;
+    }
+  }
+  return true;
 }
 
 // Send code with optional run-length encoding
@@ -1520,7 +1571,83 @@ inline int hufEncode(const int64_t* hcode, const uint16_t* in, int ni, int rlc, 
   return static_cast<int>((out - outStart) * 8 + lc);
 }
 
-// Pack encoding table for storage
+// Encode data using Huffman codes with bounds checking
+// Returns output size in bits, or -1 on buffer overflow
+inline int hufEncodeSafe(const int64_t* hcode, const uint16_t* in, int ni, int rlc,
+                         uint8_t* out, const uint8_t* outEnd) {
+  uint8_t* outStart = out;
+  int64_t c = 0;
+  int lc = 0;
+
+  if (ni == 0) return 0;
+
+  int s = in[0];
+  int cs = 0;
+
+  for (int i = 1; i < ni; i++) {
+    if (s == in[i] && cs < 255) {
+      cs++;
+    } else {
+      if (!sendCodeSafe(hcode[s], cs, hcode[rlc], c, lc, out, outEnd)) return -1;
+      cs = 0;
+    }
+    s = in[i];
+  }
+
+  // Send remaining code
+  if (!sendCodeSafe(hcode[s], cs, hcode[rlc], c, lc, out, outEnd)) return -1;
+
+  // Flush remaining bits
+  if (lc) {
+    if (out >= outEnd) return -1;
+    *out++ = static_cast<uint8_t>((c << (8 - lc)) & 0xFF);
+  }
+
+  return static_cast<int>((out - outStart) * 8 + lc);
+}
+
+// Pack encoding table for storage with bounds checking
+// Uses run-length encoding for zero-length codes
+// Returns false if buffer overflow would occur
+inline bool hufPackEncTableSafe(const int64_t* hcode, int im, int iM,
+                                 uint8_t*& out, const uint8_t* outEnd) {
+  int64_t c = 0;
+  int lc = 0;
+
+  for (int i = im; i <= iM; i++) {
+    int l = static_cast<int>(hcode[i] & 63);
+
+    if (l == 0) {
+      // Count consecutive zeros
+      int zerun = 1;
+      while (i + zerun <= iM && (hcode[i + zerun] & 63) == 0 && zerun < 255) {
+        zerun++;
+      }
+
+      if (zerun >= SHORTEST_LONG_RUN) {
+        if (!outputBitsSafe(6, LONG_ZEROCODE_RUN, c, lc, out, outEnd)) return false;
+        if (!outputBitsSafe(8, zerun - SHORTEST_LONG_RUN, c, lc, out, outEnd)) return false;
+        i += zerun - 1;
+      } else if (zerun >= 2) {
+        if (!outputBitsSafe(6, SHORT_ZEROCODE_RUN + zerun - 2, c, lc, out, outEnd)) return false;
+        i += zerun - 1;
+      } else {
+        if (!outputBitsSafe(6, 0, c, lc, out, outEnd)) return false;
+      }
+    } else {
+      if (!outputBitsSafe(6, l, c, lc, out, outEnd)) return false;
+    }
+  }
+
+  // Flush remaining bits
+  if (lc) {
+    if (out >= outEnd) return false;
+    *out++ = static_cast<uint8_t>((c << (8 - lc)) & 0xFF);
+  }
+  return true;
+}
+
+// Pack encoding table for storage (legacy, no bounds checking)
 // Uses run-length encoding for zero-length codes
 inline void hufPackEncTable(const int64_t* hcode, int im, int iM, uint8_t*& out) {
   int64_t c = 0;
@@ -1579,6 +1706,53 @@ inline int hufCompress(const uint16_t* raw, int nRaw, uint8_t* compressed) {
 
   uint8_t* dataStart = tableEnd;
   int nBits = hufEncode(freq.data(), raw, nRaw, iM, dataStart);
+  int dataLength = (nBits + 7) / 8;
+
+  // Write header
+  std::memcpy(compressed, &im, 4);
+  std::memcpy(compressed + 4, &iM, 4);
+  std::memcpy(compressed + 8, &tableLength, 4);
+  std::memcpy(compressed + 12, &nBits, 4);
+  int zero = 0;
+  std::memcpy(compressed + 16, &zero, 4);  // Reserved
+
+  return static_cast<int>(dataStart + dataLength - compressed);
+}
+
+// Huffman compress uint16 data with bounds checking
+// Returns compressed size, or -1 on buffer overflow, or 0 on encoding failure
+inline int hufCompressSafe(const uint16_t* raw, int nRaw,
+                           uint8_t* compressed, const uint8_t* compressedEnd) {
+  if (nRaw == 0) return 0;
+
+  // Need at least 20 bytes for header
+  if (compressed + 20 > compressedEnd) return -1;
+
+  std::vector<int64_t> freq(HUF_ENCSIZE);
+
+  countFrequencies(freq.data(), raw, nRaw);
+
+  int im = 0, iM = 0;
+  if (!hufBuildEncTable(freq.data(), &im, &iM)) {
+    return 0;  // Encoding failed
+  }
+
+  // Write header: im, iM, tableLength, nBits, reserved
+  uint8_t* tableStart = compressed + 20;
+  uint8_t* tableEnd = tableStart;
+
+  // Pack encoding table with bounds checking
+  if (!hufPackEncTableSafe(freq.data(), im, iM, tableEnd, compressedEnd)) {
+    return -1;  // Buffer overflow
+  }
+  int tableLength = static_cast<int>(tableEnd - tableStart);
+
+  // Encode data with bounds checking
+  uint8_t* dataStart = tableEnd;
+  int nBits = hufEncodeSafe(freq.data(), raw, nRaw, iM, dataStart, compressedEnd);
+  if (nBits < 0) {
+    return -1;  // Buffer overflow
+  }
   int dataLength = (nBits + 7) / 8;
 
   // Write header
@@ -1751,23 +1925,19 @@ inline tinyexr::v2::Result<size_t> CompressPizV2(
   std::memcpy(buf, &zero, sizeof(int));
   buf += sizeof(int);
 
-  // Huffman compress
-  size_t remainingCapacity = bufEnd - buf;
-  // Estimate max Huffman output size (header + table + data)
-  // Huffman has 20-byte header + table + encoded data
-  if (remainingCapacity < 20 + tmpBuffer.size() * 2) {
+  // Huffman compress with bounds checking
+  int huffLen = hufCompressSafe(tmpBuffer.data(), static_cast<int>(tmpBuffer.size()), buf, bufEnd);
+  if (huffLen < 0) {
     return Result<size_t>::error(ErrorInfo(
       ErrorCode::CompressionError,
       "PIZ output buffer too small for Huffman data",
       "CompressPizV2", 0
     ));
   }
-
-  int huffLen = hufCompress(tmpBuffer.data(), static_cast<int>(tmpBuffer.size()), buf);
-  if (huffLen <= 0) {
+  if (huffLen == 0) {
     return Result<size_t>::error(ErrorInfo(
       ErrorCode::CompressionError,
-      "PIZ Huffman compression failed",
+      "PIZ Huffman encoding failed",
       "CompressPizV2", 0
     ));
   }

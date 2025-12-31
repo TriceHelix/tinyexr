@@ -521,48 +521,116 @@ static inline uint16_t LogToHalf(uint16_t log_val) {
   return g_b44_log_table[log_val & 0x3FFF];
 }
 
-// Unpack one 4x4 block from B44 compressed data
+// Unpack one 4x4 block from B44 compressed 14 bytes (matches OpenEXR unpack14)
 static void UnpackB44Block(uint16_t dst[16], const uint8_t src[14]) {
-  // B44 packs 16 half values into 14 bytes using log-space delta encoding
-  // Format: 2 bytes base (14-bit log) + 12 bytes for 15 6-bit deltas (90 bits)
+  // Extract t[0] (stored as ordered-magnitude value)
+  uint16_t s0 = (static_cast<uint16_t>(src[0]) << 8) | src[1];
 
-  InitB44Tables();
+  // Extract shift and compute bias
+  uint16_t shift = src[2] >> 2;
+  uint16_t bias = static_cast<uint16_t>(0x20u << shift);
 
-  // Read 14-bit base value (big-endian, packed into 2 bytes)
-  uint16_t base_log = (static_cast<uint16_t>(src[0]) << 8) | src[1];
-  base_log &= 0x3FFF;  // 14-bit mask
+  // Reconstruct t values using running differences
+  // Pattern: s[0]->s[4]->s[8]->s[12], then s[0]->s[1], s[4]->s[5], etc.
 
-  // First pixel uses base directly
-  dst[0] = LogToHalf(base_log);
+  uint16_t s4 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s0) +
+    static_cast<uint32_t>(((static_cast<uint32_t>(src[2]) << 4) |
+                           (static_cast<uint32_t>(src[3]) >> 4)) & 0x3fu) * (1u << shift) - bias);
 
-  // Decode the 15 6-bit deltas from remaining 12 bytes
-  const uint8_t* delta_ptr = src + 2;
-  int bit_pos = 0;
+  uint16_t s8 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s4) +
+    static_cast<uint32_t>(((static_cast<uint32_t>(src[3]) << 2) |
+                           (static_cast<uint32_t>(src[4]) >> 6)) & 0x3fu) * (1u << shift) - bias);
 
-  for (int i = 1; i < 16; i++) {
-    int byte_idx = bit_pos / 8;
-    int bit_offset = bit_pos % 8;
+  uint16_t s12 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s8) +
+    static_cast<uint32_t>(src[4] & 0x3fu) * (1u << shift) - bias);
 
-    // Read 6 bits spanning potentially 2 bytes
-    uint32_t bits = delta_ptr[byte_idx];
-    if (byte_idx + 1 < 12) {
-      bits |= (static_cast<uint32_t>(delta_ptr[byte_idx + 1]) << 8);
+  uint16_t s1 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s0) +
+    static_cast<uint32_t>(src[5] >> 2) * (1u << shift) - bias);
+
+  uint16_t s5 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s4) +
+    static_cast<uint32_t>(((static_cast<uint32_t>(src[5]) << 4) |
+                           (static_cast<uint32_t>(src[6]) >> 4)) & 0x3fu) * (1u << shift) - bias);
+
+  uint16_t s9 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s8) +
+    static_cast<uint32_t>(((static_cast<uint32_t>(src[6]) << 2) |
+                           (static_cast<uint32_t>(src[7]) >> 6)) & 0x3fu) * (1u << shift) - bias);
+
+  uint16_t s13 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s12) +
+    static_cast<uint32_t>(src[7] & 0x3fu) * (1u << shift) - bias);
+
+  uint16_t s2 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s1) +
+    static_cast<uint32_t>(src[8] >> 2) * (1u << shift) - bias);
+
+  uint16_t s6 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s5) +
+    static_cast<uint32_t>(((static_cast<uint32_t>(src[8]) << 4) |
+                           (static_cast<uint32_t>(src[9]) >> 4)) & 0x3fu) * (1u << shift) - bias);
+
+  uint16_t s10 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s9) +
+    static_cast<uint32_t>(((static_cast<uint32_t>(src[9]) << 2) |
+                           (static_cast<uint32_t>(src[10]) >> 6)) & 0x3fu) * (1u << shift) - bias);
+
+  uint16_t s14 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s13) +
+    static_cast<uint32_t>(src[10] & 0x3fu) * (1u << shift) - bias);
+
+  uint16_t s3 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s2) +
+    static_cast<uint32_t>(src[11] >> 2) * (1u << shift) - bias);
+
+  uint16_t s7 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s6) +
+    static_cast<uint32_t>(((static_cast<uint32_t>(src[11]) << 4) |
+                           (static_cast<uint32_t>(src[12]) >> 4)) & 0x3fu) * (1u << shift) - bias);
+
+  uint16_t s11 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s10) +
+    static_cast<uint32_t>(((static_cast<uint32_t>(src[12]) << 2) |
+                           (static_cast<uint32_t>(src[13]) >> 6)) & 0x3fu) * (1u << shift) - bias);
+
+  uint16_t s15 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s14) +
+    static_cast<uint32_t>(src[13] & 0x3fu) * (1u << shift) - bias);
+
+  // Store t values
+  dst[0] = s0;   dst[1] = s1;   dst[2] = s2;   dst[3] = s3;
+  dst[4] = s4;   dst[5] = s5;   dst[6] = s6;   dst[7] = s7;
+  dst[8] = s8;   dst[9] = s9;   dst[10] = s10; dst[11] = s11;
+  dst[12] = s12; dst[13] = s13; dst[14] = s14; dst[15] = s15;
+
+  // Convert from ordered-magnitude to half-float
+  for (int i = 0; i < 16; i++) {
+    if (dst[i] & 0x8000) {
+      dst[i] &= 0x7fff;  // Positive: clear sign bit
+    } else {
+      dst[i] = static_cast<uint16_t>(~dst[i]);  // Negative: invert all bits
     }
-    bits >>= bit_offset;
-    bits &= 0x3F;  // 6 bits
+  }
+}
 
-    // Convert 6-bit unsigned to signed delta (-31 to +32)
-    int delta = static_cast<int>(bits) - 31;
+// Unpack a 3-byte flat block (all pixels same value)
+static void UnpackB44FlatBlock(uint16_t dst[16], const uint8_t src[3]) {
+  uint16_t t = (static_cast<uint16_t>(src[0]) << 8) | src[1];
 
-    // Apply delta in log space
-    int result_log = static_cast<int>(base_log) + delta;
-    if (result_log < 0) result_log = 0;
-    if (result_log > 16383) result_log = 16383;
+  // Convert from ordered-magnitude to half-float
+  uint16_t h;
+  if (t & 0x8000) {
+    h = t & 0x7fff;
+  } else {
+    h = static_cast<uint16_t>(~t);
+  }
 
-    // Convert back to half-float
-    dst[i] = LogToHalf(static_cast<uint16_t>(result_log));
-
-    bit_pos += 6;
+  for (int i = 0; i < 16; i++) {
+    dst[i] = h;
   }
 }
 
@@ -639,26 +707,26 @@ static bool DecompressB44V2(uint8_t* dst, size_t expected_size,
       for (int bx = 0; bx < num_blocks_x; bx++) {
         uint16_t block[16];
 
-        if (is_b44a && in_ptr + 3 <= in_end) {
-          // Check for flat block (3 bytes: 1 flag + 2 value)
-          // If flag byte has high bit set, it's a flat block
-          if (in_ptr[0] & 0x80) {
-            uint16_t flat_val = (static_cast<uint16_t>(in_ptr[1]) << 8) | in_ptr[2];
-            for (int i = 0; i < 16; i++) {
-              block[i] = flat_val;
-            }
-            in_ptr += 3;
-          } else if (in_ptr + 14 <= in_end) {
-            UnpackB44Block(block, in_ptr);
-            in_ptr += 14;
-          } else {
-            return false;
-          }
-        } else if (in_ptr + 14 <= in_end) {
+        if (in_ptr + 3 > in_end) return false;
+
+        // Check for flat block (shift >= 13, i.e. in_ptr[2] >= (13 << 2))
+        if (in_ptr[2] >= (13 << 2)) {
+          // 3-byte flat block
+          UnpackB44FlatBlock(block, in_ptr);
+          in_ptr += 3;
+        } else {
+          // Regular 14-byte block
+          if (in_ptr + 14 > in_end) return false;
           UnpackB44Block(block, in_ptr);
           in_ptr += 14;
-        } else {
-          return false;
+        }
+
+        // Apply p_linear conversion (log table) if needed
+        if (channels[c].p_linear) {
+          InitB44Tables();
+          for (int i = 0; i < 16; i++) {
+            block[i] = g_b44_log_table[block[i]];
+          }
         }
 
         // Copy block to temp buffer (with bounds checking for edge blocks)
@@ -3428,8 +3496,15 @@ Result<std::vector<uint8_t>> SaveToMemory(const ImageData& image, int compressio
 
       case COMPRESSION_PIZ: {
         // PIZ compression: wavelet + Huffman
-        // Ensure output buffer is large enough (worst case: uncompressed + overhead)
-        compress_buffer.resize(actual_bytes + actual_bytes / 100 + 1024);
+        // Buffer needs to be large enough for:
+        // - 4 bytes min/max bitmap range
+        // - Up to 8192 bytes bitmap
+        // - 4 bytes Huffman length
+        // - 20 bytes Huffman header
+        // - Up to ~50KB Huffman encoding table (65537 entries * 6 bits packed)
+        // - Encoded data (could be larger than input in worst case)
+        // Use actual_bytes * 2 + 65536 to be safe
+        compress_buffer.resize(actual_bytes * 2 + 65536);
         auto piz_result = tinyexr::piz::CompressPizV2(
             compress_buffer.data(), compress_buffer.size(),
             scanline_buffer.data(), actual_bytes,
@@ -3723,7 +3798,8 @@ static bool WriteTile(Writer& writer, const float* image_data,
 
     case COMPRESSION_PIZ: {
       // PIZ compression: wavelet + Huffman
-      compress_buffer.resize(actual_tile_size + actual_tile_size / 100 + 1024);
+      // Same buffer sizing as scanline PIZ (see comment there)
+      compress_buffer.resize(actual_tile_size * 2 + 65536);
       auto piz_result = tinyexr::piz::CompressPizV2(
           compress_buffer.data(), compress_buffer.size(),
           tile_buffer.data(), actual_tile_size,
