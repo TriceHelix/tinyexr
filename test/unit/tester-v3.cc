@@ -613,6 +613,166 @@ TEST(c_api_parse_real_file) {
     exr_context_destroy(ctx);
 }
 
+/* ============================================================================
+ * Async Data Source for Testing
+ * ============================================================================ */
+
+struct AsyncTestSource {
+    const uint8_t* data;
+    size_t size;
+    int fetch_count;
+    bool complete_immediately;  /* If false, returns WOULD_BLOCK first time */
+
+    /* Pending fetch state */
+    void* pending_dst;
+    size_t pending_size;
+    ExrFetchComplete pending_callback;
+    void* pending_userdata;
+};
+
+static ExrResult async_test_fetch(void* userdata, uint64_t offset, uint64_t size,
+                                   void* dst, ExrFetchComplete on_complete,
+                                   void* complete_userdata) {
+    AsyncTestSource* src = (AsyncTestSource*)userdata;
+    src->fetch_count++;
+
+    if (offset + size > src->size) {
+        return EXR_ERROR_OUT_OF_BOUNDS;
+    }
+
+    /* Copy the data */
+    memcpy(dst, src->data + offset, size);
+
+    /* Simulate async behavior - first fetch returns WOULD_BLOCK */
+    if (!src->complete_immediately && on_complete) {
+        /* Store callback for later completion */
+        src->pending_dst = dst;
+        src->pending_size = size;
+        src->pending_callback = on_complete;
+        src->pending_userdata = complete_userdata;
+        return EXR_WOULD_BLOCK;
+    }
+
+    return EXR_SUCCESS;
+}
+
+static void async_test_complete_pending(AsyncTestSource* src) {
+    if (src->pending_callback) {
+        src->pending_callback(src->pending_userdata, EXR_SUCCESS, src->pending_size);
+        src->pending_callback = nullptr;
+    }
+}
+
+TEST(c_api_async_header_parsing) {
+    /* Test that async data sources work for header parsing.
+     * Header parsing uses local stack buffers, so it falls back to sync
+     * even for async sources. This test verifies that works correctly.
+     */
+    std::vector<uint8_t> data = read_file("../../asakusa.exr");
+    if (data.empty()) {
+        printf("[SKIPPED - file not found] ");
+        return;
+    }
+
+    ExrContextCreateInfo ctx_info = {};
+    ctx_info.api_version = TINYEXR_C_API_VERSION;
+
+    ExrContext ctx = nullptr;
+    ExrResult result = exr_context_create(&ctx_info, &ctx);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    /* Create async data source */
+    AsyncTestSource async_src = {};
+    async_src.data = data.data();
+    async_src.size = data.size();
+    async_src.complete_immediately = true;  /* Header parsing uses sync fallback */
+
+    ExrDataSource source = {};
+    source.userdata = &async_src;
+    source.fetch = async_test_fetch;
+    source.total_size = data.size();
+    source.flags = EXR_DATA_SOURCE_SEEKABLE | EXR_DATA_SOURCE_ASYNC | EXR_DATA_SOURCE_SIZE_KNOWN;
+
+    ExrDecoderCreateInfo dec_info = {};
+    dec_info.source = source;
+
+    ExrDecoder decoder = nullptr;
+    result = exr_decoder_create(ctx, &dec_info, &decoder);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    /* Header parsing should complete synchronously (sync fallback for local buffers) */
+    ExrImage image = nullptr;
+    result = exr_decoder_parse_header(decoder, &image);
+
+    printf("[fetches=%d] ", async_src.fetch_count);
+
+    REQUIRE_EQ(result, EXR_SUCCESS);
+    REQUIRE(image != nullptr);
+
+    /* Verify parsed header */
+    ExrImageInfo info = {};
+    result = exr_image_get_info(image, &info);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+    REQUIRE(info.width > 0);
+    REQUIRE(info.height > 0);
+
+    exr_decoder_destroy(decoder);
+    exr_context_destroy(ctx);
+}
+
+TEST(c_api_async_immediate_completion) {
+    /* Test async source that completes immediately (no WOULD_BLOCK) */
+    std::vector<uint8_t> data = read_file("../../asakusa.exr");
+    if (data.empty()) {
+        printf("[SKIPPED - file not found] ");
+        return;
+    }
+
+    ExrContextCreateInfo ctx_info = {};
+    ctx_info.api_version = TINYEXR_C_API_VERSION;
+
+    ExrContext ctx = nullptr;
+    ExrResult result = exr_context_create(&ctx_info, &ctx);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    /* Create async data source that completes immediately */
+    AsyncTestSource async_src = {};
+    async_src.data = data.data();
+    async_src.size = data.size();
+    async_src.complete_immediately = true;  /* Complete immediately */
+
+    ExrDataSource source = {};
+    source.userdata = &async_src;
+    source.fetch = async_test_fetch;
+    source.total_size = data.size();
+    source.flags = EXR_DATA_SOURCE_SEEKABLE | EXR_DATA_SOURCE_ASYNC | EXR_DATA_SOURCE_SIZE_KNOWN;
+
+    ExrDecoderCreateInfo dec_info = {};
+    dec_info.source = source;
+
+    ExrDecoder decoder = nullptr;
+    result = exr_decoder_create(ctx, &dec_info, &decoder);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    /* Parse header - should complete without WOULD_BLOCK */
+    ExrImage image = nullptr;
+    result = exr_decoder_parse_header(decoder, &image);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+    REQUIRE(image != nullptr);
+
+    printf("[fetches=%d] ", async_src.fetch_count);
+
+    /* Verify parsed header */
+    ExrImageInfo info = {};
+    result = exr_image_get_info(image, &info);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+    REQUIRE(info.width > 0);
+    REQUIRE(info.height > 0);
+
+    exr_decoder_destroy(decoder);
+    exr_context_destroy(ctx);
+}
+
 TEST(c_api_command_buffer_recording) {
     ExrContextCreateInfo ctx_info = {};
     ctx_info.api_version = TINYEXR_C_API_VERSION;
@@ -1384,6 +1544,130 @@ TEST(c_api_verify_b44_vs_v1) {
     printf("[%dx%dx%d verified] ", width, height, num_channels);
 }
 
+/* Test tiled image reading */
+TEST(c_api_verify_tiled) {
+    /* Try to find a tiled EXR file */
+    const char* tiled_paths[] = {
+        "../../openexr-images/Tiles/GoldenGate.exr",
+        "../../openexr-images/Tiles/Spirals.exr",
+        "../../openexr-images/Tiles/Ocean.exr",
+        nullptr
+    };
+
+    std::vector<uint8_t> fileData;
+    const char* used_path = nullptr;
+    for (int i = 0; tiled_paths[i]; i++) {
+        fileData = read_file(tiled_paths[i]);
+        if (!fileData.empty()) {
+            used_path = tiled_paths[i];
+            break;
+        }
+    }
+
+    if (fileData.empty()) {
+        printf("[SKIPPED - no tiled test file found] ");
+        return;
+    }
+
+    /* Parse with V3 API */
+    ExrContextCreateInfo ctx_info = {};
+    ctx_info.api_version = TINYEXR_C_API_VERSION;
+    ExrContext ctx = nullptr;
+    ExrResult result = exr_context_create(&ctx_info, &ctx);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrDataSource source = {};
+    result = exr_data_source_from_memory(fileData.data(), fileData.size(), &source);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrDecoderCreateInfo dec_info = {};
+    dec_info.source = source;
+    ExrDecoder decoder = nullptr;
+    result = exr_decoder_create(ctx, &dec_info, &decoder);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrImage v3_header = nullptr;
+    result = exr_decoder_parse_header(decoder, &v3_header);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrPart part = nullptr;
+    result = exr_image_get_part(v3_header, 0, &part);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrPartInfo part_info = {};
+    result = exr_part_get_info(part, &part_info);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    /* Verify this is a tiled image */
+    if (part_info.part_type != EXR_PART_TILED) {
+        printf("[SKIPPED - not a tiled image] ");
+        exr_part_destroy(part);
+        exr_decoder_destroy(decoder);
+        exr_context_destroy(ctx);
+        return;
+    }
+
+    printf("[tiled %dx%d ch=%d] ", part_info.width, part_info.height,
+           part_info.num_channels);
+
+    /* Get actual pixel type from first channel */
+    ExrChannelInfo ch_info = {};
+    result = exr_part_get_channel(part, 0, &ch_info);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    int bytes_per_pixel = (ch_info.pixel_type == EXR_PIXEL_HALF) ? 2 : 4;
+
+    /* Allocate V3 output buffer */
+    size_t buffer_size = (size_t)part_info.width * part_info.height *
+                         part_info.num_channels * bytes_per_pixel;
+    std::vector<uint8_t> v3_buffer(buffer_size, 0);
+
+    ExrCommandBufferCreateInfo cmd_info = {};
+    cmd_info.decoder = decoder;
+    ExrCommandBuffer cmd = nullptr;
+    result = exr_command_buffer_create(ctx, &cmd_info, &cmd);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    result = exr_command_buffer_begin(cmd);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrFullImageRequest full_req = {};
+    full_req.part = part;
+    full_req.output.data = v3_buffer.data();
+    full_req.output.size = buffer_size;
+    full_req.channels_mask = 0;
+    full_req.output_pixel_type = ch_info.pixel_type;
+
+    result = exr_cmd_request_full_image(cmd, &full_req);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    result = exr_command_buffer_end(cmd);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrSubmitInfo submit_info = {};
+    ExrCommandBuffer cmd_buffers[] = { cmd };
+    submit_info.command_buffer_count = 1;
+    submit_info.command_buffers = cmd_buffers;
+
+    result = exr_submit(decoder, &submit_info);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    /* Verify data is non-zero (basic sanity check) */
+    bool has_non_zero = false;
+    for (size_t i = 0; i < v3_buffer.size() && !has_non_zero; i++) {
+        if (v3_buffer[i] != 0) has_non_zero = true;
+    }
+    REQUIRE_EQ(has_non_zero, true);
+
+    /* Clean up */
+    exr_part_destroy(part);
+    exr_command_buffer_destroy(cmd);
+    exr_decoder_destroy(decoder);
+    exr_context_destroy(ctx);
+
+    printf("[loaded OK] ");
+}
+
 /* ============================================================================
  * Main
  * ============================================================================ */
@@ -1413,6 +1697,10 @@ int main() {
     run_test_c_api_parse_invalid_version();
     run_test_c_api_parse_real_file();
 
+    printf("\n[Async Parsing Tests]\n");
+    run_test_c_api_async_header_parsing();
+    run_test_c_api_async_immediate_completion();
+
     printf("\n[Command Buffer Tests]\n");
     run_test_c_api_command_buffer_recording();
     run_test_c_api_submit_basic();
@@ -1420,6 +1708,7 @@ int main() {
     run_test_c_api_verify_piz_vs_v1();
     run_test_c_api_verify_pxr24_vs_v1();
     run_test_c_api_verify_b44_vs_v1();
+    run_test_c_api_verify_tiled();
 
     printf("\n[C++ Wrapper Tests]\n");
     run_test_cpp_version_string();

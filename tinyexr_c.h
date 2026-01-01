@@ -697,6 +697,52 @@ void exr_deep_sample_info_free(ExrContext ctx, ExrDeepSampleInfo* info);
 ExrResult exr_cmd_request_deep_scanlines(ExrCommandBuffer cmd,
                                           const ExrDeepScanlineRequest* request);
 
+/* Deep sample information for a tile */
+typedef struct ExrDeepTileSampleInfo {
+    int32_t tile_x;               /* Tile X coordinate */
+    int32_t tile_y;               /* Tile Y coordinate */
+    int32_t level_x;              /* Level X (mipmap/ripmap) */
+    int32_t level_y;              /* Level Y (mipmap/ripmap) */
+    int32_t width;                /* Width of tile in pixels */
+    int32_t height;               /* Height of tile in pixels */
+    uint64_t total_samples;       /* Total sample count across all pixels */
+    uint32_t* sample_counts;      /* [width * height] sample count per pixel */
+    uint64_t* sample_offsets;     /* [width * height + 1] cumulative offsets */
+} ExrDeepTileSampleInfo;
+
+/* Request for deep tile data */
+typedef struct ExrDeepTileRequest {
+    ExrPart part;
+    int32_t tile_x;               /* Tile X coordinate */
+    int32_t tile_y;               /* Tile Y coordinate */
+    int32_t level_x;              /* Level X (mipmap/ripmap) */
+    int32_t level_y;              /* Level Y (mipmap/ripmap) */
+    ExrDeepTileSampleInfo* sample_info; /* Output: filled with sample counts */
+    ExrBuffer output;             /* Output: sample data (sized after sample_info) */
+    uint32_t channels_mask;       /* Which channels to load */
+    uint32_t output_pixel_type;   /* Output pixel format */
+} ExrDeepTileRequest;
+
+/* Query sample counts for a deep tile (does not load pixel data) */
+ExrResult exr_part_get_deep_tile_sample_counts(
+    ExrDecoder decoder,
+    ExrPart part,
+    int32_t tile_x,
+    int32_t tile_y,
+    int32_t level_x,
+    int32_t level_y,
+    ExrDeepTileSampleInfo* out_info
+);
+
+/* Free deep tile sample info */
+void exr_deep_tile_sample_info_free(ExrContext ctx, ExrDeepTileSampleInfo* info);
+
+/* Request deep tile data (must call get_deep_tile_sample_counts first) */
+ExrResult exr_cmd_request_deep_tiles(ExrCommandBuffer cmd,
+                                      const ExrDeepTileRequest* request);
+ExrResult exr_cmd_request_deep_tile_batch(ExrCommandBuffer cmd, uint32_t count,
+                                           const ExrDeepTileRequest* requests);
+
 /* ============================================================================
  * Full Image Request (Convenience)
  * ============================================================================ */
@@ -915,6 +961,25 @@ typedef struct ExrDeepScanlineWrite {
 
 ExrResult exr_cmd_write_deep_scanlines(ExrCommandBuffer cmd,
                                         const ExrDeepScanlineWrite* write);
+
+/* Deep tile write request */
+typedef struct ExrDeepTileWrite {
+    ExrWriteImage image;
+    int32_t tile_x;                   /* Tile X coordinate */
+    int32_t tile_y;                   /* Tile Y coordinate */
+    int32_t level_x;                  /* Level X (mipmap/ripmap) */
+    int32_t level_y;                  /* Level Y (mipmap/ripmap) */
+    int32_t width;                    /* Width of tile in pixels */
+    int32_t height;                   /* Height of tile in pixels */
+    const uint32_t* sample_counts;    /* [width * height] samples per pixel */
+    uint64_t total_samples;           /* Sum of all sample_counts */
+    ExrBuffer input;                  /* Sample data (interleaved or planar) */
+    uint32_t input_layout;            /* EXR_LAYOUT_INTERLEAVED or PLANAR */
+    uint32_t input_pixel_type;        /* Pixel type of input data */
+} ExrDeepTileWrite;
+
+ExrResult exr_cmd_write_deep_tiles(ExrCommandBuffer cmd,
+                                    const ExrDeepTileWrite* write);
 
 /* Submit write commands */
 ExrResult exr_submit_write(ExrEncoder encoder, const ExrSubmitInfo* submit_info);

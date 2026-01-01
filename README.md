@@ -541,6 +541,53 @@ int EXRGetWavelengths(const EXRHeader* header, float* wavelengths, int max);
 
 See `examples/spectral/` for a complete read/write example.
 
+## V3 API (Beta)
+
+TinyEXR V3 is a modern, production-quality C API with C++17 wrapper. It provides:
+
+- **Pure C11/C17 core**: No C++ dependencies in the C API
+- **C++17 wrapper**: RAII, `Result<T>`, range-based iteration
+- **Vulkan-style API**: Command buffers, fences, explicit synchronization
+- **Async/WASM-friendly**: Asyncify support, streaming I/O callbacks
+- **Exception-free**: Compatible with `-fno-exceptions -fno-rtti`
+
+### V3 Feature Comparison
+
+| Feature | V1 API | V3 API |
+|---------|--------|--------|
+| Error handling | Error codes + strings | `Result<T>` with error stack |
+| I/O model | Synchronous | Async with callbacks |
+| Threading | OpenMP | Command buffers, fences |
+| API style | Direct pointers | Opaque handles |
+| Memory | Manual | RAII (C++), explicit (C) |
+| Compression (read) | All | All except DWAA/DWAB |
+| Compression (write) | ZIP only | NONE, RLE, ZIP, ZIPS, PIZ, PXR24, B44 |
+| Deep images | Load only | Detection only (TODO) |
+
+### V3 Quick Example (C++)
+
+```cpp
+#include "tinyexr_v3.hh"
+
+using namespace tinyexr::v3;
+
+auto ctx = Context::create().value;
+auto decoder = Decoder::from_file(ctx, "input.exr").value;
+auto image = decoder.parse_header().value;
+
+auto part = image.get_part(0).value;
+std::cout << "Size: " << part.width() << "x" << part.height() << "\n";
+
+// Range-based tile iteration
+for (auto tile : part.tiles(0)) {
+    // Load tile at (tile.tile_x, tile.tile_y)
+}
+```
+
+**See**: [TINYEXR_V3_README.md](TINYEXR_V3_README.md) for complete documentation.
+
+**Status**: Beta - suitable for evaluation and testing. V1 API remains stable for production use.
+
 ## V2 API (Experimental)
 
 TinyEXR includes an experimental V2 API in separate header files that provides:

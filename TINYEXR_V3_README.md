@@ -102,7 +102,7 @@ exr_context_destroy(ctx);
 | Tiled images | ✅ Complete | Including mipmap/ripmap |
 | Multipart files | ✅ Complete | Up to 254 parts |
 | Deep scanline | ✅ Complete | Full sample counts and pixel data loading |
-| Deep tiled | ⚠️ Partial | Detection only, no pixel data |
+| Deep tiled | ✅ Complete | Full sample counts and pixel data loading |
 | Async I/O | ✅ Complete | Fetch callbacks, WASM Asyncify |
 | Custom attributes | ✅ Complete | Full read support |
 
@@ -114,7 +114,7 @@ exr_context_destroy(ctx);
 | Tiled images | ✅ Complete | Including mipmap/ripmap |
 | Multipart files | ⚠️ Partial | Single-part multipart works, true multi-part TODO |
 | Deep scanline | ✅ Complete | ZIP compression |
-| Deep tiled | ❌ Not implemented | |
+| Deep tiled | ✅ Complete | ZIP compression |
 | Custom attributes | ✅ Complete | int/float/string and generic |
 
 ### Compression Formats
@@ -139,7 +139,7 @@ exr_context_destroy(ctx);
 | Scanline | ✅ | ✅ | ✅ | ✅ |
 | Tiled | ✅ | ✅ | ✅ | ✅ |
 | Deep Scanline | ✅ | ✅ | ✅ | ✅ |
-| Deep Tiled | ✅ | ✅ | ❌ | ❌ |
+| Deep Tiled | ✅ | ✅ | ✅ | ✅ |
 | Multipart | ✅ | ✅ | ✅ | ⚠️ |
 | Mipmap | ✅ | ✅ | ✅ | ✅ |
 | Ripmap | ✅ | ✅ | ✅ | ✅ |
@@ -153,23 +153,15 @@ exr_context_destroy(ctx);
    - Complex DCT implementation required
    - Alternative: Convert files to ZIP/PIZ format
 
-2. **Deep Tiled Image Reading**
-   - Header parsing works
-   - Pixel data loading not implemented (deep scanline works)
-
 ### Medium Priority
 
-3. **Deep Tiled Image Writing**
-   - Deep scanline writing ✅ Implemented
-   - Deep tiled writing not yet implemented
-
-4. **Multipart Writing**
+2. **True Multipart Writing**
    - Single-part multipart writing ✅ (writes name/type attributes, multipart flag)
    - True multi-part (multiple ExrWriteImage per file) needs coordination
 
 ### Low Priority
 
-5. **Direct Chunk Compression/Decompression API**
+3. **Direct Chunk Compression/Decompression API**
    - `exr_decompress_chunk()` / `exr_compress_chunk()` ✅ Implemented
    - Supports NONE, RLE, ZIP/ZIPS decompression and compression
    - PIZ decompression only (compression requires channel info)
