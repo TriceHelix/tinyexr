@@ -52,6 +52,11 @@
 #include <cpuid.h>
 #endif
 
+/* SIMD acceleration (optional) */
+#ifdef TINYEXR_V3_USE_SIMD
+#include "tinyexr_simd_c.h"
+#endif
+
 /* Thread-local storage */
 #if defined(_MSC_VER)
 #define EXR_THREAD_LOCAL __declspec(thread)
@@ -4365,6 +4370,9 @@ static void init_half_tables(void) {
 }
 
 void exr_convert_half_to_float(const uint16_t* src, float* dst, size_t count) {
+#ifdef TINYEXR_V3_USE_SIMD
+    exr_simd_half_to_float(src, dst, count);
+#else
     init_half_tables();
 
     for (size_t i = 0; i < count; i++) {
@@ -4373,9 +4381,13 @@ void exr_convert_half_to_float(const uint16_t* src, float* dst, size_t count) {
                      g_exponent_table[h >> 10];
         memcpy(&dst[i], &f, sizeof(float));
     }
+#endif
 }
 
 void exr_convert_float_to_half(const float* src, uint16_t* dst, size_t count) {
+#ifdef TINYEXR_V3_USE_SIMD
+    exr_simd_float_to_half(src, dst, count);
+#else
     init_half_tables();
 
     for (size_t i = 0; i < count; i++) {
@@ -4388,26 +4400,35 @@ void exr_convert_float_to_half(const float* src, uint16_t* dst, size_t count) {
                             ((f & 0x007FFFFF) >> g_shift_table[exp | sign_idx]));
         dst[i] |= (uint16_t)sign;
     }
+#endif
 }
 
 void exr_interleave_rgba(const float* r, const float* g, const float* b,
                           const float* a, float* rgba, size_t pixel_count) {
+#ifdef TINYEXR_V3_USE_SIMD
+    exr_simd_interleave_rgba(r, g, b, a, rgba, pixel_count);
+#else
     for (size_t i = 0; i < pixel_count; i++) {
         rgba[i * 4 + 0] = r ? r[i] : 0.0f;
         rgba[i * 4 + 1] = g ? g[i] : 0.0f;
         rgba[i * 4 + 2] = b ? b[i] : 0.0f;
         rgba[i * 4 + 3] = a ? a[i] : 1.0f;
     }
+#endif
 }
 
 void exr_deinterleave_rgba(const float* rgba, float* r, float* g, float* b,
                             float* a, size_t pixel_count) {
+#ifdef TINYEXR_V3_USE_SIMD
+    exr_simd_deinterleave_rgba(rgba, r, g, b, a, pixel_count);
+#else
     for (size_t i = 0; i < pixel_count; i++) {
         if (r) r[i] = rgba[i * 4 + 0];
         if (g) g[i] = rgba[i * 4 + 1];
         if (b) b[i] = rgba[i * 4 + 2];
         if (a) a[i] = rgba[i * 4 + 3];
     }
+#endif
 }
 
 /* ============================================================================
@@ -6775,6 +6796,9 @@ static size_t rle_encode(const uint8_t* src, size_t src_size, uint8_t* dst, size
 /* Helper: reorder bytes for RLE/ZIP compression
    Split bytes into two halves: first half gets even-indexed bytes, second half gets odd-indexed bytes */
 static void reorder_bytes_for_compression(const uint8_t* src, uint8_t* dst, size_t size) {
+#ifdef TINYEXR_V3_USE_SIMD
+    exr_simd_reorder_bytes(src, dst, size);
+#else
     size_t half = (size + 1) / 2;
     uint8_t* t1 = dst;
     uint8_t* t2 = dst + half;
@@ -6784,11 +6808,15 @@ static void reorder_bytes_for_compression(const uint8_t* src, uint8_t* dst, size
         if (s < stop) *t1++ = *s++;
         if (s < stop) *t2++ = *s++;
     }
+#endif
 }
 
 /* Helper: apply delta predictor for RLE/ZIP compression
    Each byte becomes (current - previous + 128) mod 256 */
 static void apply_delta_predictor_encode(uint8_t* data, size_t size) {
+#ifdef TINYEXR_V3_USE_SIMD
+    exr_simd_delta_encode(data, size);
+#else
     if (size < 2) return;
     uint8_t* end = data + size - 1;
     while (end > data) {
@@ -6796,6 +6824,7 @@ static void apply_delta_predictor_encode(uint8_t* data, size_t size) {
         end[0] = (uint8_t)d;
         --end;
     }
+#endif
 }
 
 /* Helper: compress scanline data */
