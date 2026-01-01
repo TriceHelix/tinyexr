@@ -18,6 +18,15 @@
 #include <stdio.h>
 #include <stdbool.h>
 
+/* alloca for stack allocation */
+#if defined(_WIN32)
+#include <malloc.h>
+#elif defined(__EMSCRIPTEN__)
+#include <alloca.h>
+#else
+#include <alloca.h>
+#endif
+
 /* C11 atomics for C, std::atomic for C++ */
 #ifdef __cplusplus
 #include <atomic>
