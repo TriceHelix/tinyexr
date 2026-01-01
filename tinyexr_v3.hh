@@ -980,6 +980,89 @@ inline std::string get_version_string() {
     return exr_get_version_string();
 }
 
+/* ============================================================================
+ * C++20 Coroutine Support (Optional)
+ *
+ * When compiled with C++20 and coroutines enabled, provides awaitable types
+ * for async operations:
+ *
+ * Example usage:
+ *   Task<Result<Image>> load_async(const std::string& path) {
+ *       auto decoder = co_await create_decoder(path);
+ *       auto image = co_await decoder->parse_header_async();
+ *       // ...
+ *   }
+ *
+ * To enable, define TINYEXR_V3_ENABLE_COROUTINES before including this header.
+ * ============================================================================ */
+
+#if defined(TINYEXR_V3_ENABLE_COROUTINES) && __cplusplus >= 202002L
+#include <coroutine>
+
+/**
+ * Basic async task type for coroutines.
+ * This is a minimal implementation - users may want to integrate with
+ * their own async runtime (e.g., cppcoro, folly::coro, asio).
+ */
+template<typename T>
+struct AsyncTask {
+    struct promise_type;
+    using handle_type = std::coroutine_handle<promise_type>;
+
+    struct promise_type {
+        T value;
+        std::exception_ptr exception;
+
+        AsyncTask get_return_object() {
+            return AsyncTask(handle_type::from_promise(*this));
+        }
+        std::suspend_never initial_suspend() { return {}; }
+        std::suspend_always final_suspend() noexcept { return {}; }
+        void return_value(T v) { value = std::move(v); }
+        void unhandled_exception() { exception = std::current_exception(); }
+    };
+
+    handle_type coro;
+
+    explicit AsyncTask(handle_type h) : coro(h) {}
+    AsyncTask(AsyncTask&& other) noexcept : coro(other.coro) { other.coro = nullptr; }
+    ~AsyncTask() { if (coro) coro.destroy(); }
+
+    T get() {
+        if (coro.promise().exception)
+            std::rethrow_exception(coro.promise().exception);
+        return std::move(coro.promise().value);
+    }
+
+    bool done() const { return coro.done(); }
+    void resume() { if (!coro.done()) coro.resume(); }
+};
+
+/**
+ * Awaitable for async fetch operations.
+ * When awaited, suspends the coroutine until the fetch completes.
+ */
+struct FetchAwaitable {
+    ExrDecoder decoder;
+    ExrSuspendState suspend_state = nullptr;
+    ExrResult result = EXR_SUCCESS;
+
+    bool await_ready() const noexcept { return false; }
+
+    void await_suspend(std::coroutine_handle<> h) {
+        /* Store the coroutine handle for later resumption */
+        /* In a real implementation, this would register with an async runtime */
+        (void)h;
+        exr_decoder_get_suspend_state(decoder, &suspend_state);
+    }
+
+    ExrResult await_resume() noexcept {
+        return result;
+    }
+};
+
+#endif /* TINYEXR_V3_ENABLE_COROUTINES && C++20 */
+
 } // namespace v3
 } // namespace tinyexr
 

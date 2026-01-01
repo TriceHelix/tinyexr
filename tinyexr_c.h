@@ -395,6 +395,40 @@ ExrResult exr_decoder_parse_header(ExrDecoder decoder, ExrImage* out_image);
 ExrResult exr_decoder_wait_idle(ExrDecoder decoder);
 
 /* ============================================================================
+ * Async/Suspend API
+ *
+ * These functions support asynchronous operation for environments where
+ * blocking I/O is not available (e.g., WebAssembly, JavaScript, async runtimes).
+ *
+ * When a decoder operation returns EXR_WOULD_BLOCK:
+ * 1. Call exr_decoder_get_suspend_state() to get the suspend state
+ * 2. Call exr_suspend_get_pending_fetch() to get fetch details
+ * 3. Perform the async fetch externally
+ * 4. Call exr_suspend_complete_fetch() with the fetched data
+ * 5. Call exr_decoder_resume() to continue processing
+ * 6. Repeat until the operation completes or errors
+ * ============================================================================ */
+
+/* Pending fetch information for async operations */
+typedef struct ExrPendingFetch {
+    uint64_t offset;          /* File offset to fetch from */
+    uint64_t size;            /* Number of bytes to fetch */
+    void* destination;        /* Where to write fetched data (may be NULL) */
+} ExrPendingFetch;
+
+/* Get the current suspend state from a decoder that returned EXR_WOULD_BLOCK */
+ExrResult exr_decoder_get_suspend_state(ExrDecoder decoder, ExrSuspendState* out_state);
+
+/* Get information about the pending fetch that caused suspension */
+ExrResult exr_suspend_get_pending_fetch(ExrSuspendState state, ExrPendingFetch* out_fetch);
+
+/* Complete a pending fetch operation with externally fetched data */
+ExrResult exr_suspend_complete_fetch(ExrSuspendState state, const void* data, size_t size);
+
+/* Resume a suspended decoder operation */
+ExrResult exr_decoder_resume(ExrDecoder decoder);
+
+/* ============================================================================
  * Image (Parsed Header + Offset Table)
  * ============================================================================ */
 
@@ -623,6 +657,47 @@ ExrResult exr_cmd_request_scanline_blocks(ExrCommandBuffer cmd, uint32_t count,
                                            const ExrScanlineRequest* requests);
 
 /* ============================================================================
+ * Deep Image Support
+ * ============================================================================ */
+
+/* Deep sample information for a scanline block */
+typedef struct ExrDeepSampleInfo {
+    int32_t y_start;              /* First scanline in block */
+    int32_t num_lines;            /* Number of scanlines */
+    int32_t width;                /* Width of scanlines */
+    uint64_t total_samples;       /* Total sample count across all pixels */
+    uint32_t* sample_counts;      /* [width * num_lines] sample count per pixel */
+    uint64_t* sample_offsets;     /* [width * num_lines + 1] cumulative offsets */
+} ExrDeepSampleInfo;
+
+/* Request for deep scanline data */
+typedef struct ExrDeepScanlineRequest {
+    ExrPart part;
+    int32_t y_start;              /* Starting scanline */
+    int32_t num_lines;            /* Number of scanlines (0 = full block) */
+    ExrDeepSampleInfo* sample_info; /* Output: filled with sample counts */
+    ExrBuffer output;             /* Output: sample data (sized after sample_info) */
+    uint32_t channels_mask;       /* Which channels to load */
+    uint32_t output_pixel_type;   /* Output pixel format */
+} ExrDeepScanlineRequest;
+
+/* Query sample counts for a deep scanline block (does not load pixel data) */
+ExrResult exr_part_get_deep_sample_counts(
+    ExrDecoder decoder,
+    ExrPart part,
+    int32_t y_start,
+    int32_t num_lines,
+    ExrDeepSampleInfo* out_info
+);
+
+/* Free sample info allocated by exr_part_get_deep_sample_counts */
+void exr_deep_sample_info_free(ExrContext ctx, ExrDeepSampleInfo* info);
+
+/* Request deep scanline data (must call get_deep_sample_counts first) */
+ExrResult exr_cmd_request_deep_scanlines(ExrCommandBuffer cmd,
+                                          const ExrDeepScanlineRequest* request);
+
+/* ============================================================================
  * Full Image Request (Convenience)
  * ============================================================================ */
 
@@ -771,6 +846,7 @@ typedef struct ExrWriteImageCreateInfo {
     int32_t tile_size_y;
     const ExrBox2i* data_window;  /* NULL for default (0,0,w-1,h-1) */
     const ExrBox2i* display_window; /* NULL for same as data_window */
+    const char* part_name;        /* Part name (required for multipart) */
 } ExrWriteImageCreateInfo;
 
 typedef struct ExrWriteImage_T* ExrWriteImage;
@@ -823,6 +899,22 @@ typedef struct ExrScanlineWrite {
 
 ExrResult exr_cmd_write_scanlines(ExrCommandBuffer cmd,
                                    const ExrScanlineWrite* write);
+
+/* Deep scanline writing */
+typedef struct ExrDeepScanlineWrite {
+    ExrWriteImage image;
+    int32_t y_start;                  /* Starting scanline */
+    int32_t num_lines;                /* Number of scanlines (usually 1) */
+    int32_t width;                    /* Width of scanlines */
+    const uint32_t* sample_counts;    /* [width * num_lines] samples per pixel */
+    uint64_t total_samples;           /* Sum of all sample_counts */
+    ExrBuffer input;                  /* Sample data (interleaved or planar) */
+    uint32_t input_layout;            /* EXR_LAYOUT_INTERLEAVED or PLANAR */
+    uint32_t input_pixel_type;        /* Pixel type of input data */
+} ExrDeepScanlineWrite;
+
+ExrResult exr_cmd_write_deep_scanlines(ExrCommandBuffer cmd,
+                                        const ExrDeepScanlineWrite* write);
 
 /* Submit write commands */
 ExrResult exr_submit_write(ExrEncoder encoder, const ExrSubmitInfo* submit_info);
