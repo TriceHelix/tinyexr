@@ -560,7 +560,7 @@ TinyEXR V3 is a modern, production-quality C API with C++17 wrapper. It provides
 | Threading | OpenMP | Command buffers, fences |
 | API style | Direct pointers | Opaque handles |
 | Memory | Manual | RAII (C++), explicit (C) |
-| Compression (read) | All | All except DWAA/DWAB |
+| Compression (read) | All except DWAA/DWAB | All except DWAA/DWAB |
 | Compression (write) | ZIP only | NONE, RLE, ZIP, ZIPS, PIZ, PXR24, B44 |
 | Deep images | Load only | Detection only (TODO) |
 
